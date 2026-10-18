@@ -1,0 +1,12 @@
+{
+  "name": "dsa-tracker-backend",
+  "version": "1.0.0",
+  "description": "FastAPI Python backend service for DSA Learning Tracker",
+  "scripts": {
+    "dev": "./venv/bin/python run.py",
+    "start": "./venv/bin/python run.py",
+    "test": "./venv/bin/pytest",
+    "migrate": "./venv/bin/python -m alembic upgrade head",
+    "stamp": "./venv/bin/python -m alembic stamp head"
+  }
+}
