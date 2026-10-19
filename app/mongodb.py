@@ -41,8 +41,19 @@ def get_mongo_client() -> Optional[pymongo.MongoClient]:
             _mongo_client.admin.command('ping')
             logger.info("Successfully connected to MongoDB.")
         except Exception as e:
-            logger.warning(f"MongoDB connection attempt failed: {e}. Falling back gracefully.")
-            _mongo_client = None
+            logger.warning(f"MongoDB connection attempt with tlsCAFile failed: {e}. Trying fallback connection...")
+            try:
+                fallback_kwargs = {
+                    "serverSelectionTimeoutMS": 5000,
+                    "connectTimeoutMS": 5000,
+                    "socketTimeoutMS": 10000,
+                }
+                _mongo_client = pymongo.MongoClient(mongo_uri, **fallback_kwargs)
+                _mongo_client.admin.command('ping')
+                logger.info("Successfully connected to MongoDB via fallback.")
+            except Exception as e2:
+                logger.error(f"MongoDB fallback connection also failed: {e2}")
+                _mongo_client = None
     return _mongo_client
 
 def get_mongo_db() -> Optional[Database]:
