@@ -299,6 +299,7 @@ def enable_or_create_folder_share(
     )
 
 @router.patch("/{folder_id}/share", response_model=ShareResponse)
+@router.put("/{folder_id}/share", response_model=ShareResponse)
 def toggle_folder_share_status(
     folder_id: str,
     update_data: ShareStatusUpdate,
