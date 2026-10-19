@@ -2,10 +2,18 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
+from sqlalchemy import func
 from app.database import get_db
 from app.models.folder import Folder
 from app.models.user import User
-from app.schemas.folder import FolderCreate, FolderUpdate, FolderMove, FolderTreeResponse
+from app.schemas.folder import (
+    FolderCreate, FolderUpdate, FolderMove, FolderTreeResponse, ReorderItem,
+    ShareResponse, ShareStatusUpdate
+)
+from app.mongodb import (
+    get_share_for_folder_mongo, create_or_get_share_mongo,
+    update_share_status_mongo, revoke_share_mongo
+)
 from app.routers.auth import get_current_user
 from app.services.folder_service import (
     build_tree_for_user,
@@ -38,13 +46,22 @@ def create_folder(
 
     tags_json = json.dumps(folder_in.tags) if folder_in.tags else "[]"
 
+    if folder_in.position is not None and folder_in.position > 0:
+        folder_pos = folder_in.position
+    else:
+        max_pos = db.query(func.max(Folder.position)).filter(
+            Folder.user_id == current_user.id,
+            Folder.parent_id == folder_in.parent_id
+        ).scalar()
+        folder_pos = (max_pos + 1) if max_pos is not None else 0
+
     folder = Folder(
         user_id=current_user.id,
         parent_id=folder_in.parent_id,
         name=folder_in.name.strip(),
         description=folder_in.description or "",
         tags=tags_json,
-        position=folder_in.position or 0
+        position=folder_pos
     )
     db.add(folder)
     db.commit()
@@ -72,6 +89,20 @@ def create_folder(
         subfolders=[],
         questions=[]
     )
+
+@router.post("/reorder")
+def reorder_folders(
+    items: List[ReorderItem],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    for item in items:
+        db.query(Folder).filter(
+            Folder.id == item.id,
+            Folder.user_id == current_user.id
+        ).update({"position": item.position})
+    db.commit()
+    return {"message": "Folders reordered successfully"}
 
 @router.put("/{folder_id}", response_model=FolderTreeResponse)
 def update_folder(
@@ -189,3 +220,116 @@ def delete_folder(
     db.commit()
 
     return {"message": "Folder and contents deleted successfully", "deleted_folder_ids": list(all_target_ids)}
+
+# =========================================================================
+# Pattern Sharing Endpoints (Ownership Checked & Persisted in MongoDB)
+# =========================================================================
+
+def _resolve_folder_name(folder_id: str, db: Session, current_user: User) -> str:
+    if folder_id == "all":
+        return "All Patterns"
+    folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == current_user.id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found or unauthorized")
+    return folder.name
+
+@router.get("/{folder_id}/share", response_model=ShareResponse)
+def get_folder_share_settings(
+    folder_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    folder_name = _resolve_folder_name(folder_id, db, current_user)
+    share = get_share_for_folder_mongo(current_user.id, folder_id)
+    if not share:
+        raise HTTPException(status_code=404, detail="No share configuration found for this folder")
+
+    return ShareResponse(
+        share_id=share["share_id"],
+        folder_id=share["folder_id"],
+        folder_name=share.get("folder_name") or folder_name,
+        is_active=share.get("is_active", False),
+        share_url=f"/shared/{share['share_id']}",
+        created_at=share.get("created_at", ""),
+        updated_at=share.get("updated_at", "")
+    )
+
+@router.post("/{folder_id}/share", response_model=ShareResponse)
+def enable_or_create_folder_share(
+    folder_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    folder_name = _resolve_folder_name(folder_id, db, current_user)
+    share = create_or_get_share_mongo(
+        user_id=current_user.id,
+        folder_id=folder_id,
+        folder_name=folder_name,
+        email=current_user.email,
+        full_name=current_user.full_name or "",
+        hashed_password=current_user.hashed_password or ""
+    )
+    return ShareResponse(
+        share_id=share["share_id"],
+        folder_id=share["folder_id"],
+        folder_name=share.get("folder_name") or folder_name,
+        is_active=share.get("is_active", True),
+        share_url=f"/shared/{share['share_id']}",
+        created_at=share.get("created_at", ""),
+        updated_at=share.get("updated_at", "")
+    )
+
+@router.patch("/{folder_id}/share", response_model=ShareResponse)
+def toggle_folder_share_status(
+    folder_id: str,
+    update_data: ShareStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    folder_name = _resolve_folder_name(folder_id, db, current_user)
+    share = update_share_status_mongo(current_user.id, folder_id, update_data.is_active)
+    if not share:
+        raise HTTPException(status_code=404, detail="Share settings not found")
+
+    return ShareResponse(
+        share_id=share["share_id"],
+        folder_id=share["folder_id"],
+        folder_name=share.get("folder_name") or folder_name,
+        is_active=share.get("is_active", False),
+        share_url=f"/shared/{share['share_id']}",
+        created_at=share.get("created_at", ""),
+        updated_at=share.get("updated_at", "")
+    )
+
+@router.post("/{folder_id}/share/revoke", response_model=ShareResponse)
+def revoke_and_regenerate_folder_share(
+    folder_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    folder_name = _resolve_folder_name(folder_id, db, current_user)
+    share = revoke_share_mongo(current_user.id, folder_id, regenerate_new=True, folder_name=folder_name)
+    if not share:
+        raise HTTPException(status_code=404, detail="Failed to revoke share link")
+
+    return ShareResponse(
+        share_id=share["share_id"],
+        folder_id=share["folder_id"],
+        folder_name=share.get("folder_name") or folder_name,
+        is_active=share.get("is_active", True),
+        share_url=f"/shared/{share['share_id']}",
+        created_at=share.get("created_at", ""),
+        updated_at=share.get("updated_at", "")
+    )
+
+@router.delete("/{folder_id}/share")
+def disable_folder_share(
+    folder_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    _resolve_folder_name(folder_id, db, current_user)
+    revoke_share_mongo(current_user.id, folder_id, regenerate_new=False)
+    return {"message": "Sharing disabled successfully for this pattern"}
+
+

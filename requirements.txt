@@ -11,3 +11,4 @@ pytest==9.1.1
 httpx==0.28.1
 email-validator>=2.0.0
 psycopg2-binary>=2.9.9
+pymongo>=4.0.0

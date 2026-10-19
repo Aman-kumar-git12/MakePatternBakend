@@ -8,7 +8,7 @@ class FolderBase(BaseModel):
     parent_id: Optional[str] = None
     description: Optional[str] = ""
     tags: Optional[List[str]] = []
-    position: Optional[int] = 0
+    position: Optional[int] = None
 
 class FolderCreate(FolderBase):
     pass
@@ -23,6 +23,10 @@ class FolderUpdate(BaseModel):
 class FolderMove(BaseModel):
     target_parent_id: Optional[str] = None
     new_position: Optional[int] = None
+
+class ReorderItem(BaseModel):
+    id: str
+    position: int
 
 class FolderTreeResponse(BaseModel):
     id: str
@@ -42,3 +46,23 @@ class FolderTreeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 FolderTreeResponse.model_rebuild()
+
+class ShareStatusUpdate(BaseModel):
+    is_active: bool
+
+class ShareResponse(BaseModel):
+    share_id: str
+    folder_id: str
+    folder_name: str
+    is_active: bool
+    share_url: str
+    created_at: str
+    updated_at: str
+
+class PublicSharedPatternResponse(BaseModel):
+    share_id: str
+    owner_name: str
+    share_type: str = "single"  # "single" or "all"
+    pattern: Optional[FolderTreeResponse] = None
+    patterns: Optional[List[FolderTreeResponse]] = None
+

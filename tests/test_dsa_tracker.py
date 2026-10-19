@@ -23,6 +23,9 @@ def setup_db():
         db.add(user)
         db.commit()
         db.refresh(user)
+    
+    from app.models.folder import Folder
+    if db.query(Folder).filter(Folder.user_id == user.id).count() == 0:
         seed_demo_data(db, user)
     db.close()
 

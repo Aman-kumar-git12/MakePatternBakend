@@ -1,6 +1,7 @@
 import json
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 from app.database import get_db
 from app.models.question import Question
@@ -15,6 +16,7 @@ from app.schemas.question import (
     QuestionListItem
 )
 from app.schemas.solution import SolutionResponse
+from app.schemas.folder import ReorderItem
 from app.routers.auth import get_current_user
 from app.services.folder_service import get_folder_path_string
 
@@ -122,7 +124,7 @@ def list_questions(
             (Question.tags.ilike(search_filter))
         )
 
-    questions = query.order_by(Question.updated_at.desc()).all()
+    questions = query.order_by(Question.position.asc(), Question.created_at.asc()).all()
     bookmarked_ids = {b.question_id for b in db.query(Bookmark).filter(Bookmark.user_id == current_user.id).all()}
 
     result = []
@@ -144,6 +146,8 @@ def list_questions(
                 tags=tags_list,
                 is_bookmarked=(q.id in bookmarked_ids),
                 folder_path=get_folder_path_string(db, q.folder_id),
+                position=q.position or 0,
+                created_at=q.created_at,
                 updated_at=q.updated_at
             )
         )
@@ -179,6 +183,15 @@ def create_question(
 
     tags_str = json.dumps(q_in.tags or [])
 
+    if q_in.position is not None and q_in.position > 0:
+        q_pos = q_in.position
+    else:
+        max_pos = db.query(func.max(Question.position)).filter(
+            Question.user_id == current_user.id,
+            Question.folder_id == q_in.folder_id
+        ).scalar()
+        q_pos = (max_pos + 1) if max_pos is not None else 0
+
     question = Question(
         user_id=current_user.id,
         folder_id=q_in.folder_id,
@@ -189,13 +202,27 @@ def create_question(
         difficulty=q_in.difficulty or "Medium",
         status=q_in.status or "Not Started",
         tags=tags_str,
-        position=q_in.position or 0
+        position=q_pos
     )
     db.add(question)
     db.commit()
     db.refresh(question)
 
     return format_question_response(db, question, current_user.id)
+
+@router.post("/reorder")
+def reorder_questions(
+    items: List[ReorderItem],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    for item in items:
+        db.query(Question).filter(
+            Question.id == item.id,
+            Question.user_id == current_user.id
+        ).update({"position": item.position})
+    db.commit()
+    return {"message": "Questions reordered successfully"}
 
 @router.put("/{question_id}", response_model=QuestionResponse)
 def update_question(

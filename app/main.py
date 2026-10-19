@@ -3,8 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.database import engine, Base, SessionLocal
 from app.config import settings
-from app.routers import auth, folders, questions, solutions, bookmarks, progress, search, test_cases
-from app.services.seed_service import seed_demo_data
+from app.mongodb import init_mongodb
+from app.routers import auth, folders, questions, solutions, bookmarks, progress, search, test_cases, shared
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -21,24 +21,21 @@ async def lifespan(app: FastAPI):
         logger.critical(f"Database schema initialization failed: {e}", exc_info=True)
         raise
 
-    # Seed demo curriculum only in development when database has no users
-    if getattr(settings, "ENVIRONMENT", "production") == "development":
+    # Initialize MongoDB connection and indexes
+    try:
+        init_mongodb()
+        # Automatically sync existing SQLite users to MongoDB
+        from app.models.user import User as SqlUser
+        from app.mongodb import sync_all_sqlite_users_to_mongo
         db = SessionLocal()
         try:
-            from app.models.user import User
-            user_count = db.query(User).count()
-            if user_count == 0:
-                logger.info("No users found in development database. Seeding demo user and patterns...")
-                seed_demo_data(db)
-                logger.info("Demo data seeded successfully.")
-            else:
-                logger.info(f"Database has {user_count} user(s). Demo seeding skipped.")
-        except Exception as e:
-            logger.error(f"Development demo seeding failed: {e}", exc_info=True)
+            sql_users = db.query(SqlUser).all()
+            sync_all_sqlite_users_to_mongo(sql_users)
+            logger.info(f"Successfully verified/synced {len(sql_users)} users to MongoDB.")
         finally:
             db.close()
-    else:
-        logger.info("Non-development environment: demo seeding disabled.")
+    except Exception as e:
+        logger.warning(f"MongoDB initialization/sync error: {e}")
 
     yield
 
@@ -61,8 +58,9 @@ logger.info(f"Configured CORS allowed origins: {allowed_origins}")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -75,6 +73,7 @@ app.include_router(bookmarks.router, prefix="/api")
 app.include_router(progress.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(test_cases.router, prefix="/api")
+app.include_router(shared.router, prefix="/api")
 
 
 @app.get("/api/health")

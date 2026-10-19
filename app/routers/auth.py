@@ -61,35 +61,82 @@ def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session 
         headers={"WWW-Authenticate": "Bearer"},
     )
 
+import uuid
+import logging
+import pymongo.errors
+from app.mongodb import find_user_by_email_mongo, save_user_mongo, find_user_by_id_mongo
+
+logger = logging.getLogger("dsa_tracker.auth")
+
 @router.post("/register", response_model=Token)
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.email == user_in.email).first()
-    if existing:
+    email = user_in.email.strip().lower()
+
+    # 1. Duplicate check in MongoDB & SQL
+    mongo_existing = find_user_by_email_mongo(email)
+    sql_existing = db.query(User).filter(User.email.ilike(email)).first()
+    if mongo_existing or sql_existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    # 2. Hash password securely with bcrypt
+    hashed_pw = hash_password(user_in.password)
+    user_id = str(uuid.uuid4())
+    full_name = user_in.full_name or "Aman Kumar"
+
+    # 3. Persist in MongoDB with unique index enforcement
+    try:
+        save_user_mongo(
+            user_id=user_id,
+            email=email,
+            full_name=full_name,
+            hashed_password=hashed_pw
+        )
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    except Exception as e:
+        logger.warning(f"MongoDB save warning: {e}")
+
+    # 4. Persist in SQL database for relational constraints
     user = User(
-        email=user_in.email,
-        full_name=user_in.full_name or "Aman Kumar",
-        hashed_password=hash_password(user_in.password)
+        id=user_id,
+        email=email,
+        full_name=full_name,
+        hashed_password=hashed_pw
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-
-    try:
-        from app.services.seed_service import seed_demo_data
-        seed_demo_data(db, user)
-    except Exception as err:
-        print(f"Seed error on user registration: {err}")
 
     token = create_access_token({"sub": user.id})
     return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
 
 @router.post("/login", response_model=Token)
 def login(credentials: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == credentials.email).first()
-    if not user or not verify_password(credentials.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    email = credentials.email.strip().lower()
+
+    # Look up in SQL
+    user = db.query(User).filter(User.email.ilike(email)).first()
+
+    # If not in SQL, check MongoDB
+    if not user:
+        mongo_user = find_user_by_email_mongo(email)
+        if mongo_user and verify_password(credentials.password, mongo_user["hashed_password"]):
+            user = User(
+                id=mongo_user.get("id") or str(mongo_user.get("_id")),
+                email=mongo_user["email"],
+                full_name=mongo_user.get("full_name") or "Aman Kumar",
+                hashed_password=mongo_user["hashed_password"]
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        else:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+    else:
+        if not verify_password(credentials.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        # Ensure MongoDB has the user synced
+        save_user_mongo(user.id, user.email, user.full_name, user.hashed_password)
 
     token = create_access_token({"sub": user.id})
     return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
