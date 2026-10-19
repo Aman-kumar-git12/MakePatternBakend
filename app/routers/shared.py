@@ -29,7 +29,12 @@ def get_shared_pattern(
     """
     # 1. First check the frozen point-in-time snapshot in MongoDB
     snapshot = get_share_snapshot_mongo(share_id)
-    if snapshot and snapshot.get("is_active"):
+    if snapshot:
+        if not snapshot.get("is_active"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This shared pattern link has been revoked or disabled by the owner."
+            )
         patterns = snapshot.get("patterns", [])
         return PublicSharedPatternResponse(
             share_id=share_id,
@@ -94,7 +99,12 @@ def get_shared_question(
     """
     # 1. First look up the question in the frozen snapshot
     snapshot = get_share_snapshot_mongo(share_id)
-    if snapshot and snapshot.get("is_active"):
+    if snapshot:
+        if not snapshot.get("is_active"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This shared pattern link has been revoked or disabled by the owner."
+            )
         questions_map = snapshot.get("questions", {})
         if question_id in questions_map:
             return QuestionResponse.model_validate(questions_map[question_id])

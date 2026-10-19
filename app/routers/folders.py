@@ -285,8 +285,8 @@ def enable_or_create_folder_share(
         hashed_password=current_user.hashed_password or ""
     )
 
-    # Capture and freeze an immutable snapshot of this pattern hierarchy, questions & solutions
-    capture_and_save_share_snapshot(db, current_user, folder_id, folder_name, share["share_id"])
+    # Capture and freeze an immutable snapshot of this pattern hierarchy, questions & solutions (never overwrites if already existing)
+    capture_and_save_share_snapshot(db, current_user, folder_id, folder_name, share["share_id"], force_overwrite=False)
 
     return ShareResponse(
         share_id=share["share_id"],
@@ -334,7 +334,7 @@ def revoke_and_regenerate_folder_share(
         raise HTTPException(status_code=404, detail="Failed to revoke share link")
 
     # Capture a fresh snapshot for the new share link
-    capture_and_save_share_snapshot(db, current_user, folder_id, folder_name, share["share_id"])
+    capture_and_save_share_snapshot(db, current_user, folder_id, folder_name, share["share_id"], force_overwrite=True)
 
     return ShareResponse(
         share_id=share["share_id"],

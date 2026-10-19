@@ -10,7 +10,7 @@ from app.services.folder_service import (
     get_all_descendant_folder_ids
 )
 from app.routers.questions import format_question_response
-from app.mongodb import save_share_snapshot_mongo
+from app.mongodb import save_share_snapshot_mongo, get_share_snapshot_mongo
 
 logger = logging.getLogger("dsa_tracker.share_service")
 
@@ -77,11 +77,19 @@ def capture_and_save_share_snapshot(
     current_user: User,
     folder_id: str,
     folder_name: str,
-    share_id: str
+    share_id: str,
+    force_overwrite: bool = False
 ) -> bool:
     """
     Takes the snapshot and saves it permanently to MongoDB Atlas share_snapshots collection.
+    If a snapshot already exists for this share_id and force_overwrite is False, preserves the point-in-time snapshot.
     """
+    if not force_overwrite:
+        existing = get_share_snapshot_mongo(share_id)
+        if existing and existing.get("patterns") is not None:
+            logger.info(f"Immutable snapshot already exists for share_id {share_id}. Preserving point-in-time state.")
+            return True
+
     owner_name = current_user.full_name or "Curator"
     snap_data = capture_share_snapshot_data(db, current_user.id, folder_id, owner_name)
     if not snap_data:
@@ -99,3 +107,4 @@ def capture_and_save_share_snapshot(
         questions=snap_data["questions"],
         is_active=True
     )
+
