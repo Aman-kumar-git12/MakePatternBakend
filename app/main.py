@@ -79,10 +79,33 @@ app.include_router(auth.router)
 
 @app.get("/api/health")
 def health_check():
+    from app.mongodb import get_mongo_db, _CA_FILE
+    mongo_status = "disconnected"
+    mongo_err = None
+    mongo_counts = {}
+    try:
+        mdb = get_mongo_db()
+        if mdb is not None:
+            mongo_status = "connected"
+            mongo_counts = {
+                "users": mdb.users.count_documents({}),
+                "folders": mdb.folders.count_documents({}),
+                "questions": mdb.questions.count_documents({})
+            }
+        else:
+            mongo_status = "none"
+    except Exception as e:
+        mongo_status = "error"
+        mongo_err = str(e)
+
     return {
         "status": "healthy",
         "app": "DSA Learning Tracker API",
         "database": str(engine.url.database or engine.url),
+        "mongo_status": mongo_status,
+        "mongo_counts": mongo_counts,
+        "mongo_error": mongo_err,
+        "ca_file": _CA_FILE,
         "version": "1.0.0"
     }
 
