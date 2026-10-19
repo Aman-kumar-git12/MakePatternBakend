@@ -598,62 +598,170 @@ def restore_all_data_from_mongo_to_sqlite(db: Any) -> Dict[str, int]:
 
     stats = {"users": 0, "folders": 0, "questions": 0, "solutions": 0, "test_cases": 0, "bookmarks": 0}
 
-    existing_user_count = db.query(SqlUser).count()
+    logger.info("Restoring users, folders, questions, and curriculum from MongoDB Atlas...")
+
+    # 1. Restore Users
     mongo_users = list(mongo_db.users.find({}))
+    for u in mongo_users:
+        uid = u.get("id") or str(u.get("_id"))
+        email = u.get("email")
+        if not email:
+            continue
+        
+        # Reconcile if local SQLite has this email under a different id
+        existing_local = db.query(SqlUser).filter(SqlUser.email == email).first()
+        if existing_local and existing_local.id != uid:
+            # Delete conflicting local user and orphan records
+            db.query(SqlFolder).filter(SqlFolder.user_id == existing_local.id).delete()
+            db.query(SqlQuestion).filter(SqlQuestion.user_id == existing_local.id).delete()
+            db.delete(existing_local)
+            db.commit()
 
-    if existing_user_count == 0 and len(mongo_users) > 0:
-        logger.info(f"Local storage is empty. Restoring {len(mongo_users)} users and complete curriculum from MongoDB Atlas...")
+        sql_u = SqlUser(
+            id=uid,
+            email=email,
+            hashed_password=u.get("hashed_password"),
+            full_name=u.get("full_name") or "Aman Kumar",
+        )
+        db.merge(sql_u)
+        stats["users"] += 1
+    db.commit()
 
-        # 1. Restore Users
-        for u in mongo_users:
-            uid = u.get("id") or str(u.get("_id"))
-            sql_u = SqlUser(
-                id=uid,
-                email=u.get("email"),
-                hashed_password=u.get("hashed_password"),
-                full_name=u.get("full_name") or "Aman Kumar",
-            )
-            db.merge(sql_u)
-            stats["users"] += 1
-        db.commit()
+    # 2. Restore Folders
+    mongo_folders = list(mongo_db.folders.find({}))
+    def folder_depth(f):
+        d = 0
+        pid = f.get("parent_id")
+        visited = set()
+        while pid and pid not in visited:
+            visited.add(pid)
+            parent = mongo_db.folders.find_one({"id": pid})
+            if not parent:
+                break
+            pid = parent.get("parent_id")
+            d += 1
+        return d
 
-        # 2. Restore Folders
-        mongo_folders = list(mongo_db.folders.find({}))
-        # Sort folders by depth so parents are inserted before children
-        def folder_depth(f):
-            d = 0
-            pid = f.get("parent_id")
-            visited = set()
-            while pid and pid not in visited:
-                visited.add(pid)
-                parent = mongo_db.folders.find_one({"id": pid})
-                if not parent:
-                    break
-                pid = parent.get("parent_id")
-                d += 1
-            return d
+    mongo_folders.sort(key=folder_depth)
+    for f in mongo_folders:
+        sql_f = SqlFolder(
+            id=f.get("id") or str(f.get("_id")),
+            user_id=f.get("user_id"),
+            name=f.get("name"),
+            description=f.get("description", ""),
+            parent_id=f.get("parent_id"),
+            position=f.get("position", 0),
+            tags=f.get("tags", []),
+        )
+        db.merge(sql_f)
+        stats["folders"] += 1
+    db.commit()
 
-        mongo_folders.sort(key=folder_depth)
+    # 3. Restore Questions
+    mongo_questions = list(mongo_db.questions.find({}))
+    for q in mongo_questions:
+        sql_q = SqlQuestion(
+            id=q.get("id") or str(q.get("_id")),
+            user_id=q.get("user_id"),
+            folder_id=q.get("folder_id"),
+            title=q.get("title"),
+            difficulty=q.get("difficulty", "Medium"),
+            status=q.get("status", "Not Started"),
+            problem_url=q.get("problem_url"),
+            position=q.get("position", 0),
+        )
+        db.merge(sql_q)
+        stats["questions"] += 1
+    db.commit()
+
+    # 4. Restore Solutions
+    mongo_solutions = list(mongo_db.solutions.find({}))
+    for s in mongo_solutions:
+        sql_s = SqlSolution(
+            id=s.get("id") or str(s.get("_id")),
+            question_id=s.get("question_id"),
+            title=s.get("title") or "Optimized Approach",
+            solution_type=s.get("solution_type") or s.get("approach_type") or "Optimized",
+            code=s.get("code") or "",
+            language=s.get("language", "cpp"),
+            time_complexity=s.get("time_complexity") or "",
+            space_complexity=s.get("space_complexity") or "O(1)",
+            explanation=s.get("explanation") or s.get("notes") or "",
+            position=s.get("position", 0),
+        )
+        db.merge(sql_s)
+        stats["solutions"] += 1
+    db.commit()
+
+    # 5. Restore TestCases
+    mongo_tc = list(mongo_db.test_cases.find({}))
+    for tc in mongo_tc:
+        sql_tc = SqlTestCase(
+            id=tc.get("id") or str(tc.get("_id")),
+            question_id=tc.get("question_id"),
+            title=tc.get("title") or "Test Case",
+            input=tc.get("input") or tc.get("input_data") or "",
+            expected_output=tc.get("expected_output") or "",
+            notes=tc.get("notes") or tc.get("explanation") or "",
+            position=tc.get("position", 0),
+        )
+        db.merge(sql_tc)
+        stats["test_cases"] += 1
+    db.commit()
+
+    # 6. Restore Bookmarks
+    mongo_bm = list(mongo_db.bookmarks.find({}))
+    for b in mongo_bm:
+        sql_b = SqlBookmark(
+            id=b.get("id") or str(b.get("_id")),
+            user_id=b.get("user_id"),
+            question_id=b.get("question_id"),
+        )
+        db.merge(sql_b)
+    db.commit()
+
+    logger.info(f"MongoDB Restore Complete: {stats}")
+    return stats
+
+def restore_user_data_from_mongo_to_sqlite(db: Session, user_id: str):
+    """
+    On-demand restore for a specific user's folders, questions, solutions, and bookmarks.
+    """
+    from app.models.folder import Folder as SqlFolder
+    from app.models.question import Question as SqlQuestion
+    from app.models.solution import Solution as SqlSolution
+    from app.models.bookmark import Bookmark as SqlBookmark
+
+    mongo_db = get_mongo_db()
+    if mongo_db is None:
+        return
+
+    try:
+        # Folders
+        mongo_folders = list(mongo_db.folders.find({"user_id": user_id}))
         for f in mongo_folders:
+            fid = f.get("id") or str(f.get("_id"))
             sql_f = SqlFolder(
-                id=f.get("id") or str(f.get("_id")),
-                user_id=f.get("user_id"),
+                id=fid,
+                user_id=user_id,
                 name=f.get("name"),
-                description=f.get("description"),
+                description=f.get("description", ""),
                 parent_id=f.get("parent_id"),
                 position=f.get("position", 0),
                 tags=f.get("tags", []),
             )
             db.merge(sql_f)
-            stats["folders"] += 1
         db.commit()
 
-        # 3. Restore Questions
-        mongo_questions = list(mongo_db.questions.find({}))
+        # Questions
+        mongo_questions = list(mongo_db.questions.find({"user_id": user_id}))
+        q_ids = []
         for q in mongo_questions:
+            qid = q.get("id") or str(q.get("_id"))
+            q_ids.append(qid)
             sql_q = SqlQuestion(
-                id=q.get("id") or str(q.get("_id")),
-                user_id=q.get("user_id"),
+                id=qid,
+                user_id=user_id,
                 folder_id=q.get("folder_id"),
                 title=q.get("title"),
                 difficulty=q.get("difficulty", "Medium"),
@@ -662,62 +770,41 @@ def restore_all_data_from_mongo_to_sqlite(db: Any) -> Dict[str, int]:
                 position=q.get("position", 0),
             )
             db.merge(sql_q)
-            stats["questions"] += 1
         db.commit()
 
-        # 4. Restore Solutions
-        mongo_solutions = list(mongo_db.solutions.find({}))
-        for s in mongo_solutions:
-            sql_s = SqlSolution(
-                id=s.get("id") or str(s.get("_id")),
-                question_id=s.get("question_id"),
-                title=s.get("title"),
-                approach_type=s.get("approach_type"),
-                code=s.get("code"),
-                language=s.get("language", "cpp"),
-                time_complexity=s.get("time_complexity"),
-                space_complexity=s.get("space_complexity"),
-                notes=s.get("notes"),
-                position=s.get("position", 0),
-            )
-            db.merge(sql_s)
-            stats["solutions"] += 1
-        db.commit()
+        # Solutions
+        if q_ids:
+            mongo_solutions = list(mongo_db.solutions.find({"question_id": {"$in": q_ids}}))
+            for s in mongo_solutions:
+                sid = s.get("id") or str(s.get("_id"))
+                sql_s = SqlSolution(
+                    id=sid,
+                    question_id=s.get("question_id"),
+                    title=s.get("title") or "Optimized Approach",
+                    solution_type=s.get("solution_type") or s.get("approach_type") or "Optimized",
+                    code=s.get("code") or "",
+                    language=s.get("language", "cpp"),
+                    time_complexity=s.get("time_complexity") or "",
+                    space_complexity=s.get("space_complexity") or "O(1)",
+                    explanation=s.get("explanation") or s.get("notes") or "",
+                    position=s.get("position", 0),
+                )
+                db.merge(sql_s)
+            db.commit()
 
-        # 5. Restore TestCases
-        mongo_tc = list(mongo_db.test_cases.find({}))
-        for tc in mongo_tc:
-            sql_tc = SqlTestCase(
-                id=tc.get("id") or str(tc.get("_id")),
-                question_id=tc.get("question_id"),
-                input_data=tc.get("input_data"),
-                expected_output=tc.get("expected_output"),
-                explanation=tc.get("explanation"),
-                is_sample=tc.get("is_sample", False),
-            )
-            db.merge(sql_tc)
-            stats["test_cases"] += 1
-        db.commit()
-
-        # 6. Restore Bookmarks
-        mongo_bm = list(mongo_db.bookmarks.find({}))
+        # Bookmarks
+        mongo_bm = list(mongo_db.bookmarks.find({"user_id": user_id}))
         for b in mongo_bm:
+            bmid = b.get("id") or str(b.get("_id"))
             sql_b = SqlBookmark(
-                id=b.get("id") or str(b.get("_id")),
-                user_id=b.get("user_id"),
+                id=bmid,
+                user_id=user_id,
                 question_id=b.get("question_id"),
             )
             db.merge(sql_b)
-            stats["bookmarks"] += 1
         db.commit()
-
-        logger.info(f"MongoDB Restore Complete: {stats}")
-    else:
-        # Local storage already has data; sync any changes to Mongo
-        stats = sync_all_sqlite_data_to_mongo(db)
-        logger.info(f"MongoDB Sync Verified: {stats}")
-
-    return stats
+    except Exception as e:
+        logger.warning(f"Error in on-demand user data restore from Mongo: {e}")
 
 
 # =========================================================================

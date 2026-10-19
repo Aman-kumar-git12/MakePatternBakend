@@ -29,7 +29,12 @@ def get_folder_tree(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    return build_tree_for_user(db, current_user.id)
+    tree = build_tree_for_user(db, current_user.id)
+    if not tree:
+        from app.mongodb import restore_user_data_from_mongo_to_sqlite
+        restore_user_data_from_mongo_to_sqlite(db, current_user.id)
+        tree = build_tree_for_user(db, current_user.id)
+    return tree
 
 @router.post("/", response_model=FolderTreeResponse, status_code=status.HTTP_201_CREATED)
 def create_folder(

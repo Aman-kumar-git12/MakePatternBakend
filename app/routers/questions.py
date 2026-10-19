@@ -112,6 +112,10 @@ def list_questions(
     current_user: User = Depends(get_current_user)
 ):
     query = db.query(Question).filter(Question.user_id == current_user.id)
+    if query.count() == 0:
+        from app.mongodb import restore_user_data_from_mongo_to_sqlite
+        restore_user_data_from_mongo_to_sqlite(db, current_user.id)
+        query = db.query(Question).filter(Question.user_id == current_user.id)
 
     if folder_id:
         query = query.filter(Question.folder_id == folder_id)

@@ -64,7 +64,10 @@ def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session 
 import uuid
 import logging
 import pymongo.errors
-from app.mongodb import find_user_by_email_mongo, save_user_mongo, find_user_by_id_mongo
+from app.mongodb import (
+    find_user_by_email_mongo, save_user_mongo, find_user_by_id_mongo,
+    restore_user_data_from_mongo_to_sqlite
+)
 
 logger = logging.getLogger("dsa_tracker.auth")
 
@@ -108,50 +111,65 @@ def register(user_in: UserCreate, background_tasks: BackgroundTasks, db: Session
 def login(credentials: UserLogin, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     email = credentials.email.strip().lower()
 
-    # 1. Fast indexed lookup in SQLite
-    user = db.query(User).filter(User.email == email).first()
-
-    if user:
-        # User found in local DB: verify password
-        if not verify_password(credentials.password, user.hashed_password):
+    # 1. Look up in MongoDB Atlas FIRST to get canonical cloud user ID and data
+    mongo_user = find_user_by_email_mongo(email)
+    if mongo_user:
+        if not verify_password(credentials.password, mongo_user["hashed_password"]):
             raise HTTPException(status_code=401, detail="Incorrect password. Please verify your credentials.")
-        
-        # Sync to MongoDB in background if needed (non-blocking)
-        background_tasks.add_task(save_user_mongo, user.id, user.email, user.full_name, user.hashed_password)
-    else:
-        # Not in local SQLite: check MongoDB Atlas
-        mongo_user = find_user_by_email_mongo(email)
-        if mongo_user:
-            if not verify_password(credentials.password, mongo_user["hashed_password"]):
-                raise HTTPException(status_code=401, detail="Incorrect password. Please verify your credentials.")
-            
-            user = User(
-                id=mongo_user.get("id") or str(mongo_user.get("_id")),
+
+        canonical_id = mongo_user.get("id") or str(mongo_user.get("_id"))
+
+        # Reconcile local SQLite user if ID mismatch exists
+        local_user = db.query(User).filter(User.email == email).first()
+        if local_user and local_user.id != canonical_id:
+            from app.models.folder import Folder as SqlFolder
+            from app.models.question import Question as SqlQuestion
+            db.query(SqlFolder).filter(SqlFolder.user_id == local_user.id).delete()
+            db.query(SqlQuestion).filter(SqlQuestion.user_id == local_user.id).delete()
+            db.delete(local_user)
+            db.commit()
+            local_user = None
+
+        if not local_user:
+            local_user = User(
+                id=canonical_id,
                 email=mongo_user["email"],
                 full_name=mongo_user.get("full_name") or email.split("@")[0].replace(".", " ").title(),
                 hashed_password=mongo_user["hashed_password"]
             )
-            db.add(user)
+            db.add(local_user)
             db.commit()
-            db.refresh(user)
-        else:
-            # User is NOT present: auto-create and save immediately
-            user_id = str(uuid.uuid4())
-            full_name = email.split("@")[0].replace(".", " ").title()
-            hashed_pw = hash_password(credentials.password)
+            db.refresh(local_user)
 
-            user = User(
-                id=user_id,
-                email=email,
-                full_name=full_name,
-                hashed_password=hashed_pw
-            )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
+        # Restore user folders/questions/solutions/bookmarks into SQLite
+        restore_user_data_from_mongo_to_sqlite(db, canonical_id)
 
-            # Persist to MongoDB in background
-            background_tasks.add_task(save_user_mongo, user_id, email, full_name, hashed_pw)
+        token = create_access_token({"sub": canonical_id})
+        return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(local_user))
+
+    # 2. If not in MongoDB, check SQLite
+    user = db.query(User).filter(User.email == email).first()
+    if user:
+        if not verify_password(credentials.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Incorrect password. Please verify your credentials.")
+        background_tasks.add_task(save_user_mongo, user.id, user.email, user.full_name, user.hashed_password)
+    else:
+        # Not present anywhere: auto-create user and save
+        user_id = str(uuid.uuid4())
+        full_name = email.split("@")[0].replace(".", " ").title()
+        hashed_pw = hash_password(credentials.password)
+
+        user = User(
+            id=user_id,
+            email=email,
+            full_name=full_name,
+            hashed_password=hashed_pw
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        background_tasks.add_task(save_user_mongo, user_id, email, full_name, hashed_pw)
 
     token = create_access_token({"sub": user.id})
     return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
