@@ -12,6 +12,22 @@ from app.services.folder_service import (
 )
 from app.mongodb import find_active_share_by_id_mongo
 
+from app.schemas.folder import FolderTreeResponse, PublicSharedPatternResponse
+
+def sanitize_shared_folder_tree(node: FolderTreeResponse) -> FolderTreeResponse:
+    if not node:
+        return node
+    node.solved_count = 0
+    node.progress_percentage = 0.0
+    if node.questions:
+        for q in node.questions:
+            q.status = "Not Started"
+            q.is_bookmarked = False
+    if node.subfolders:
+        for sf in node.subfolders:
+            sanitize_shared_folder_tree(sf)
+    return node
+
 router = APIRouter(prefix="/shared", tags=["shared"])
 
 @router.get("/{share_id}", response_model=PublicSharedPatternResponse)
@@ -37,12 +53,13 @@ def get_shared_pattern(
     # Case 1: Whole list of topics / all patterns shared
     if folder_id == "all":
         pattern_trees = build_tree_for_user(db, share_info["user_id"])
+        sanitized_trees = [sanitize_shared_folder_tree(pt) for pt in pattern_trees]
         return PublicSharedPatternResponse(
             share_id=share_id,
             owner_name=share_info.get("owner_name") or "Curator",
             share_type="all",
             pattern=None,
-            patterns=pattern_trees
+            patterns=sanitized_trees
         )
 
     # Case 2: Individual pattern / topic shared
@@ -53,12 +70,13 @@ def get_shared_pattern(
             detail="The pattern associated with this share link is no longer available."
         )
 
+    sanitized_tree = sanitize_shared_folder_tree(pattern_tree)
     return PublicSharedPatternResponse(
         share_id=share_id,
         owner_name=share_info.get("owner_name") or "Curator",
         share_type="single",
-        pattern=pattern_tree,
-        patterns=[pattern_tree]
+        pattern=sanitized_tree,
+        patterns=[sanitized_tree]
     )
 
 @router.get("/{share_id}/questions/{question_id}", response_model=QuestionResponse)
@@ -87,7 +105,10 @@ def get_shared_question(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Question not found in this shared pattern collection."
             )
-        return format_question_response(db, q, user_id=share_info["user_id"])
+        resp = format_question_response(db, q, user_id=share_info["user_id"])
+        resp.status = "Not Started"
+        resp.is_bookmarked = False
+        return resp
 
     descendant_ids = get_all_descendant_folder_ids(db, folder_id)
     permitted_folder_ids = {folder_id} | descendant_ids
@@ -99,5 +120,8 @@ def get_shared_question(
             detail="Question not found in this shared pattern."
         )
 
-    return format_question_response(db, q, user_id=share_info["user_id"])
+    resp = format_question_response(db, q, user_id=share_info["user_id"])
+    resp.status = "Not Started"
+    resp.is_bookmarked = False
+    return resp
 
