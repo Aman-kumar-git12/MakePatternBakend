@@ -107,6 +107,12 @@ def get_bookmarks_collection() -> Optional[Collection]:
         return db["bookmarks"]
     return None
 
+def get_share_snapshots_collection() -> Optional[Collection]:
+    db = get_mongo_db()
+    if db is not None:
+        return db["share_snapshots"]
+    return None
+
 def init_mongodb():
     """
     Initializes MongoDB users collection, applies schema validation,
@@ -217,7 +223,12 @@ def init_mongodb():
         # Ensure indexes on bookmarks collection
         db.bookmarks.create_index("id", unique=True, name="unique_bookmark_id_idx")
         db.bookmarks.create_index([("user_id", 1), ("question_id", 1)], unique=True, name="unique_user_question_bookmark_idx")
-        logger.info("MongoDB indexes for folders, questions, solutions, test_cases, and bookmarks verified successfully.")
+
+        # Ensure indexes on share_snapshots collection
+        db.share_snapshots.create_index("share_id", unique=True, name="unique_snapshot_share_id")
+        db.share_snapshots.create_index([("user_id", 1), ("folder_id", 1)], name="snapshot_user_folder_idx")
+
+        logger.info("MongoDB indexes for folders, questions, solutions, test_cases, bookmarks, and snapshots verified successfully.")
     except Exception as e:
         logger.error(f"Error initializing MongoDB collection or index: {e}", exc_info=True)
 
@@ -1008,4 +1019,65 @@ def find_active_share_by_id_mongo(share_id: str) -> Optional[Dict[str, Any]]:
         "owner_name": user.get("full_name") or "Aman Kumar",
         "share": share_record
     }
+
+def save_share_snapshot_mongo(
+    share_id: str,
+    user_id: str,
+    owner_name: str,
+    folder_id: str,
+    folder_name: str,
+    share_type: str,
+    patterns: list,
+    questions: dict,
+    is_active: bool = True
+) -> bool:
+    coll = get_share_snapshots_collection()
+    if coll is None:
+        return False
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "share_id": share_id,
+        "user_id": user_id,
+        "owner_name": owner_name or "Curator",
+        "folder_id": folder_id,
+        "folder_name": folder_name,
+        "share_type": share_type,
+        "is_active": is_active,
+        "created_at": now_iso,
+        "patterns": patterns,
+        "questions": questions
+    }
+    coll.update_one(
+        {"share_id": share_id},
+        {"$set": doc},
+        upsert=True
+    )
+    return True
+
+def get_share_snapshot_mongo(share_id: str) -> Optional[Dict[str, Any]]:
+    coll = get_share_snapshots_collection()
+    if coll is None or not share_id:
+        return None
+    return coll.find_one({"share_id": share_id})
+
+def update_share_snapshot_status_mongo(user_id: str, folder_id: str, is_active: bool) -> bool:
+    coll = get_share_snapshots_collection()
+    if coll is None:
+        return False
+    coll.update_many(
+        {"user_id": user_id, "folder_id": folder_id},
+        {"$set": {"is_active": is_active, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return True
+
+def revoke_share_snapshot_mongo(user_id: str, folder_id: str) -> bool:
+    coll = get_share_snapshots_collection()
+    if coll is None:
+        return False
+    coll.update_many(
+        {"user_id": user_id, "folder_id": folder_id},
+        {"$set": {"is_active": False, "revoked_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return True
 

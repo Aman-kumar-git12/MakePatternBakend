@@ -10,23 +10,11 @@ from app.services.folder_service import (
     build_tree_for_user,
     get_all_descendant_folder_ids
 )
-from app.mongodb import find_active_share_by_id_mongo
-
-from app.schemas.folder import FolderTreeResponse, PublicSharedPatternResponse
-
-def sanitize_shared_folder_tree(node: FolderTreeResponse) -> FolderTreeResponse:
-    if not node:
-        return node
-    node.solved_count = 0
-    node.progress_percentage = 0.0
-    if node.questions:
-        for q in node.questions:
-            q.status = "Not Started"
-            q.is_bookmarked = False
-    if node.subfolders:
-        for sf in node.subfolders:
-            sanitize_shared_folder_tree(sf)
-    return node
+from app.mongodb import (
+    find_active_share_by_id_mongo,
+    get_share_snapshot_mongo,
+    save_share_snapshot_mongo
+)
 
 router = APIRouter(prefix="/shared", tags=["shared"])
 
@@ -36,11 +24,22 @@ def get_shared_pattern(
     db: Session = Depends(get_db)
 ):
     """
-    Public Read-Only API to retrieve a shared pattern or the whole list of topics.
-    Enforces that the shareId is valid and active in MongoDB.
-    No authentication required, but strictly read-only and scopes
-    access exclusively to the shared pattern hierarchy.
+    Public Read-Only API to retrieve an immutable point-in-time snapshot of a shared pattern.
+    Guarantees that subsequent modifications by the pattern owner do not alter this snapshot.
     """
+    # 1. First check the frozen point-in-time snapshot in MongoDB
+    snapshot = get_share_snapshot_mongo(share_id)
+    if snapshot and snapshot.get("is_active"):
+        patterns = snapshot.get("patterns", [])
+        return PublicSharedPatternResponse(
+            share_id=share_id,
+            owner_name=snapshot.get("owner_name") or "Curator",
+            share_type=snapshot.get("share_type", "single"),
+            pattern=patterns[0] if patterns else None,
+            patterns=patterns
+        )
+
+    # 2. Check if the share configuration is active in MongoDB
     share_info = find_active_share_by_id_mongo(share_id)
     if not share_info:
         raise HTTPException(
@@ -48,35 +47,39 @@ def get_shared_pattern(
             detail="Shared pattern not found, revoked, or sharing has been disabled by the owner."
         )
 
+    # 3. Create, freeze, and persist the snapshot immediately for future calls
+    user_id = share_info["user_id"]
     folder_id = share_info["share"]["folder_id"]
+    folder_name = share_info["share"].get("folder_name", "Pattern")
+    owner_name = share_info.get("owner_name", "Curator")
 
-    # Case 1: Whole list of topics / all patterns shared
-    if folder_id == "all":
-        pattern_trees = build_tree_for_user(db, share_info["user_id"])
-        sanitized_trees = [sanitize_shared_folder_tree(pt) for pt in pattern_trees]
-        return PublicSharedPatternResponse(
-            share_id=share_id,
-            owner_name=share_info.get("owner_name") or "Curator",
-            share_type="all",
-            pattern=None,
-            patterns=sanitized_trees
-        )
-
-    # Case 2: Individual pattern / topic shared
-    pattern_tree = build_tree_for_folder(db, folder_id)
-    if not pattern_tree:
+    from app.services.share_service import capture_share_snapshot_data
+    snap_data = capture_share_snapshot_data(db, user_id, folder_id, owner_name)
+    if not snap_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="The pattern associated with this share link is no longer available."
+            detail="The pattern data associated with this share is no longer available."
         )
 
-    sanitized_tree = sanitize_shared_folder_tree(pattern_tree)
+    save_share_snapshot_mongo(
+        share_id=share_id,
+        user_id=user_id,
+        owner_name=owner_name,
+        folder_id=folder_id,
+        folder_name=folder_name,
+        share_type=snap_data["share_type"],
+        patterns=snap_data["patterns"],
+        questions=snap_data["questions"],
+        is_active=True
+    )
+
+    patterns = snap_data["patterns"]
     return PublicSharedPatternResponse(
         share_id=share_id,
-        owner_name=share_info.get("owner_name") or "Curator",
-        share_type="single",
-        pattern=sanitized_tree,
-        patterns=[sanitized_tree]
+        owner_name=owner_name,
+        share_type=snap_data["share_type"],
+        pattern=patterns[0] if patterns else None,
+        patterns=patterns
     )
 
 @router.get("/{share_id}/questions/{question_id}", response_model=QuestionResponse)
@@ -86,9 +89,21 @@ def get_shared_question(
     db: Session = Depends(get_db)
 ):
     """
-    Public Read-Only API to view a specific problem and its solutions within a shared pattern.
-    Strictly verifies that the requested question belongs to the shared pattern's folder hierarchy.
+    Public Read-Only API to view a specific problem and its solutions from the frozen snapshot.
+    Guarantees the code, notes, and test cases remain frozen as of the snapshot time.
     """
+    # 1. First look up the question in the frozen snapshot
+    snapshot = get_share_snapshot_mongo(share_id)
+    if snapshot and snapshot.get("is_active"):
+        questions_map = snapshot.get("questions", {})
+        if question_id in questions_map:
+            return QuestionResponse.model_validate(questions_map[question_id])
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Question not found in this shared pattern snapshot."
+        )
+
+    # 2. If snapshot not generated yet, verify share and freeze it
     share_info = find_active_share_by_id_mongo(share_id)
     if not share_info:
         raise HTTPException(
@@ -96,32 +111,30 @@ def get_shared_question(
             detail="Shared pattern not found, revoked, or sharing has been disabled."
         )
 
+    user_id = share_info["user_id"]
     folder_id = share_info["share"]["folder_id"]
+    folder_name = share_info["share"].get("folder_name", "Pattern")
+    owner_name = share_info.get("owner_name", "Curator")
 
-    if folder_id == "all":
-        q = db.query(Question).filter(Question.id == question_id, Question.user_id == share_info["user_id"]).first()
-        if not q:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Question not found in this shared pattern collection."
-            )
-        resp = format_question_response(db, q, user_id=share_info["user_id"])
-        resp.status = "Not Started"
-        resp.is_bookmarked = False
-        return resp
-
-    descendant_ids = get_all_descendant_folder_ids(db, folder_id)
-    permitted_folder_ids = {folder_id} | descendant_ids
-
-    q = db.query(Question).filter(Question.id == question_id).first()
-    if not q or q.folder_id not in permitted_folder_ids:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Question not found in this shared pattern."
+    from app.services.share_service import capture_share_snapshot_data
+    snap_data = capture_share_snapshot_data(db, user_id, folder_id, owner_name)
+    if snap_data:
+        save_share_snapshot_mongo(
+            share_id=share_id,
+            user_id=user_id,
+            owner_name=owner_name,
+            folder_id=folder_id,
+            folder_name=folder_name,
+            share_type=snap_data["share_type"],
+            patterns=snap_data["patterns"],
+            questions=snap_data["questions"],
+            is_active=True
         )
+        if question_id in snap_data["questions"]:
+            return QuestionResponse.model_validate(snap_data["questions"][question_id])
 
-    resp = format_question_response(db, q, user_id=share_info["user_id"])
-    resp.status = "Not Started"
-    resp.is_bookmarked = False
-    return resp
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Question not found in this shared pattern."
+    )
 
