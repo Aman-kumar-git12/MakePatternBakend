@@ -17,14 +17,19 @@ try:
 except Exception:
     _CA_FILE = None
 
+_last_mongo_error: Optional[str] = None
+
+def get_last_mongo_error() -> Optional[str]:
+    return _last_mongo_error
+
 def get_mongo_client() -> Optional[pymongo.MongoClient]:
-    global _mongo_client
+    global _mongo_client, _last_mongo_error
     if _mongo_client is None:
         try:
             mongo_uri = settings.mongo_connection_uri
             client_kwargs: Dict[str, Any] = {
-                "serverSelectionTimeoutMS": 3000,
-                "connectTimeoutMS": 3000,
+                "serverSelectionTimeoutMS": 4000,
+                "connectTimeoutMS": 4000,
                 "socketTimeoutMS": 5000,
                 "maxPoolSize": 20,
                 "minPoolSize": 1,
@@ -39,6 +44,7 @@ def get_mongo_client() -> Optional[pymongo.MongoClient]:
             )
             # Ping to verify active connection
             _mongo_client.admin.command('ping')
+            _last_mongo_error = None
             logger.info("Successfully connected to MongoDB.")
         except Exception as e:
             logger.warning(f"MongoDB connection attempt with tlsCAFile failed: {e}. Trying fallback connection...")
@@ -47,12 +53,15 @@ def get_mongo_client() -> Optional[pymongo.MongoClient]:
                     "serverSelectionTimeoutMS": 5000,
                     "connectTimeoutMS": 5000,
                     "socketTimeoutMS": 10000,
+                    "tlsAllowInvalidCertificates": True,
                 }
                 _mongo_client = pymongo.MongoClient(mongo_uri, **fallback_kwargs)
                 _mongo_client.admin.command('ping')
+                _last_mongo_error = None
                 logger.info("Successfully connected to MongoDB via fallback.")
             except Exception as e2:
-                logger.error(f"MongoDB fallback connection also failed: {e2}")
+                _last_mongo_error = f"Fallback error: {type(e2).__name__}: {str(e2)} | Initial error: {type(e).__name__}: {str(e)}"
+                logger.error(f"MongoDB connection failed completely: {_last_mongo_error}")
                 _mongo_client = None
     return _mongo_client
 

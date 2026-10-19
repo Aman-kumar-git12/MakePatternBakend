@@ -79,7 +79,7 @@ app.include_router(auth.router)
 
 @app.get("/api/health")
 def health_check():
-    from app.mongodb import get_mongo_db, _CA_FILE
+    from app.mongodb import get_mongo_db, _CA_FILE, get_last_mongo_error
     mongo_status = "disconnected"
     mongo_err = None
     mongo_counts = {}
@@ -94,6 +94,7 @@ def health_check():
             }
         else:
             mongo_status = "none"
+            mongo_err = get_last_mongo_error()
     except Exception as e:
         mongo_status = "error"
         mongo_err = str(e)
