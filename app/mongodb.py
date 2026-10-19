@@ -23,7 +23,12 @@ def get_mongo_client() -> Optional[pymongo.MongoClient]:
         try:
             mongo_uri = settings.mongo_connection_uri
             client_kwargs: Dict[str, Any] = {
-                "serverSelectionTimeoutMS": 5000
+                "serverSelectionTimeoutMS": 3000,
+                "connectTimeoutMS": 3000,
+                "socketTimeoutMS": 5000,
+                "maxPoolSize": 20,
+                "minPoolSize": 1,
+                "maxIdleTimeMS": 45000,
             }
             if _CA_FILE and ("mongodb+srv" in mongo_uri or "ssl=true" in mongo_uri.lower() or "tls=true" in mongo_uri.lower()):
                 client_kwargs["tlsCAFile"] = _CA_FILE

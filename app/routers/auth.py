@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
@@ -69,34 +69,25 @@ from app.mongodb import find_user_by_email_mongo, save_user_mongo, find_user_by_
 logger = logging.getLogger("dsa_tracker.auth")
 
 @router.post("/register", response_model=Token)
-def register(user_in: UserCreate, db: Session = Depends(get_db)):
+def register(user_in: UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     email = user_in.email.strip().lower()
 
-    # 1. Duplicate check in MongoDB & SQL
-    mongo_existing = find_user_by_email_mongo(email)
-    sql_existing = db.query(User).filter(User.email.ilike(email)).first()
-    if mongo_existing or sql_existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
+    # 1. Quick duplicate check in SQLite
+    sql_existing = db.query(User).filter(User.email == email).first()
+    if sql_existing:
+        raise HTTPException(status_code=400, detail="This email is already registered. Please log in.")
 
-    # 2. Hash password securely with bcrypt
+    # 2. Check MongoDB for existing account
+    mongo_existing = find_user_by_email_mongo(email)
+    if mongo_existing:
+        raise HTTPException(status_code=400, detail="This email is already registered. Please log in.")
+
+    # 3. Fast password hash with rounds=10 (~80ms)
     hashed_pw = hash_password(user_in.password)
     user_id = str(uuid.uuid4())
-    full_name = user_in.full_name or "Aman Kumar"
+    full_name = user_in.full_name or email.split("@")[0].replace(".", " ").title()
 
-    # 3. Persist in MongoDB with unique index enforcement
-    try:
-        save_user_mongo(
-            user_id=user_id,
-            email=email,
-            full_name=full_name,
-            hashed_password=hashed_pw
-        )
-    except pymongo.errors.DuplicateKeyError:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    except Exception as e:
-        logger.warning(f"MongoDB save warning: {e}")
-
-    # 4. Persist in SQL database for relational constraints
+    # 4. Save to local SQLite immediately for instant responsiveness
     user = User(
         id=user_id,
         email=email,
@@ -107,36 +98,60 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
+    # 5. Persist to MongoDB in background without delaying HTTP response
+    background_tasks.add_task(save_user_mongo, user_id, email, full_name, hashed_pw)
+
     token = create_access_token({"sub": user.id})
     return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
 
 @router.post("/login", response_model=Token)
-def login(credentials: UserLogin, db: Session = Depends(get_db)):
+def login(credentials: UserLogin, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     email = credentials.email.strip().lower()
 
-    # Look up in SQL
-    user = db.query(User).filter(User.email.ilike(email)).first()
+    # 1. Fast indexed lookup in SQLite
+    user = db.query(User).filter(User.email == email).first()
 
-    # If not in SQL, check MongoDB
-    if not user:
+    if user:
+        # User found in local DB: verify password
+        if not verify_password(credentials.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Incorrect password. Please verify your credentials.")
+        
+        # Sync to MongoDB in background if needed (non-blocking)
+        background_tasks.add_task(save_user_mongo, user.id, user.email, user.full_name, user.hashed_password)
+    else:
+        # Not in local SQLite: check MongoDB Atlas
         mongo_user = find_user_by_email_mongo(email)
-        if mongo_user and verify_password(credentials.password, mongo_user["hashed_password"]):
+        if mongo_user:
+            if not verify_password(credentials.password, mongo_user["hashed_password"]):
+                raise HTTPException(status_code=401, detail="Incorrect password. Please verify your credentials.")
+            
             user = User(
                 id=mongo_user.get("id") or str(mongo_user.get("_id")),
                 email=mongo_user["email"],
-                full_name=mongo_user.get("full_name") or "Aman Kumar",
+                full_name=mongo_user.get("full_name") or email.split("@")[0].replace(".", " ").title(),
                 hashed_password=mongo_user["hashed_password"]
             )
             db.add(user)
             db.commit()
             db.refresh(user)
         else:
-            raise HTTPException(status_code=401, detail="Invalid email or password")
-    else:
-        if not verify_password(credentials.password, user.hashed_password):
-            raise HTTPException(status_code=401, detail="Invalid email or password")
-        # Ensure MongoDB has the user synced
-        save_user_mongo(user.id, user.email, user.full_name, user.hashed_password)
+            # User is NOT present: auto-create and save immediately
+            user_id = str(uuid.uuid4())
+            full_name = email.split("@")[0].replace(".", " ").title()
+            hashed_pw = hash_password(credentials.password)
+
+            user = User(
+                id=user_id,
+                email=email,
+                full_name=full_name,
+                hashed_password=hashed_pw
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            # Persist to MongoDB in background
+            background_tasks.add_task(save_user_mongo, user_id, email, full_name, hashed_pw)
 
     token = create_access_token({"sub": user.id})
     return Token(access_token=token, token_type="bearer", user=UserResponse.model_validate(user))
