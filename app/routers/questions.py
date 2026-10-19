@@ -153,6 +153,54 @@ def list_questions(
         )
     return result
 
+@router.get("/random", response_model=List[QuestionListItem])
+def get_random_questions(
+    count: int = Query(default=5, ge=1, le=10, description="Number of random questions to return (max 10)"),
+    only_revision: bool = Query(default=False, description="Filter only questions flagged for revision"),
+    status: Optional[str] = Query(default=None, description="Optional status filter"),
+    difficulty: Optional[str] = Query(default=None, description="Optional difficulty filter"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(Question).filter(Question.user_id == current_user.id)
+    if only_revision or status == "Needs Revision":
+        query = query.filter(Question.status == "Needs Revision")
+    elif status:
+        query = query.filter(Question.status == status)
+
+    if difficulty and difficulty != "all":
+        query = query.filter(Question.difficulty == difficulty)
+
+    questions = query.order_by(func.random()).limit(count).all()
+
+    bookmarked_ids = {b.question_id for b in db.query(Bookmark).filter(Bookmark.user_id == current_user.id).all()}
+
+    result = []
+    for q in questions:
+        tags_list = []
+        try:
+            tags_list = json.loads(q.tags) if q.tags else []
+        except Exception:
+            tags_list = [q.tags] if q.tags else []
+
+        result.append(
+            QuestionListItem(
+                id=q.id,
+                folder_id=q.folder_id,
+                title=q.title,
+                problem_url=getattr(q, 'problem_url', '') or "",
+                difficulty=q.difficulty,
+                status=q.status,
+                tags=tags_list,
+                is_bookmarked=(q.id in bookmarked_ids),
+                folder_path=get_folder_path_string(db, q.folder_id),
+                position=q.position or 0,
+                created_at=q.created_at,
+                updated_at=q.updated_at
+            )
+        )
+    return result
+
 @router.get("/{question_id}", response_model=QuestionResponse)
 def get_question(
     question_id: str,
