@@ -157,14 +157,17 @@ def list_questions(
 def get_random_questions(
     count: int = Query(default=5, ge=1, le=10, description="Number of random questions to return (max 10)"),
     only_revision: bool = Query(default=False, description="Filter only questions flagged for revision"),
+    pool: Optional[str] = Query(default="all", description="Pool to sample from: 'all', 'not_revised', or 'revision'"),
     status: Optional[str] = Query(default=None, description="Optional status filter"),
     difficulty: Optional[str] = Query(default=None, description="Optional difficulty filter"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     query = db.query(Question).filter(Question.user_id == current_user.id)
-    if only_revision or status == "Needs Revision":
+    if pool == "revision" or only_revision or status == "Needs Revision":
         query = query.filter(Question.status == "Needs Revision")
+    elif pool in ("not_revised", "unrevised", "unflagged"):
+        query = query.filter((Question.status != "Needs Revision") | (Question.status.is_(None)))
     elif status:
         query = query.filter(Question.status == status)
 
