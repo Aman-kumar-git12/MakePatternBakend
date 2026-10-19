@@ -155,7 +155,7 @@ def list_questions(
 
 @router.get("/random", response_model=List[QuestionListItem])
 def get_random_questions(
-    count: int = Query(default=5, ge=1, le=10, description="Number of random questions to return (max 10)"),
+    count: int = Query(default=3, ge=1, le=5, description="Number of random questions to return (max 5)"),
     only_revision: bool = Query(default=False, description="Filter only questions flagged for revision"),
     pool: Optional[str] = Query(default="all", description="Pool to sample from: 'all', 'not_revised', or 'revision'"),
     status: Optional[str] = Query(default=None, description="Optional status filter"),
