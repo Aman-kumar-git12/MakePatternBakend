@@ -9,7 +9,7 @@ class Question(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    folder_id = Column(String(36), ForeignKey("folders.id", ondelete="CASCADE"), nullable=False, index=True)
+    folder_id = Column(String(36), ForeignKey("folders.id", ondelete="SET NULL"), nullable=True, index=True)
     title = Column(String(255), nullable=False)
     problem_url = Column(String(500), default="")
     problem_statement = Column(Text, default="")

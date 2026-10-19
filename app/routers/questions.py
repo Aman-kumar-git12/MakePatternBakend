@@ -36,7 +36,7 @@ def format_question_response(db: Session, q: Question, user_id: str) -> Question
         Bookmark.question_id == q.id
     ).first() is not None
 
-    folder_path = get_folder_path_string(db, q.folder_id)
+    folder_path = get_folder_path_string(db, q.folder_id) if q.folder_id else ""
 
     solutions = [
         SolutionResponse(
@@ -145,7 +145,7 @@ def list_questions(
                 status=q.status,
                 tags=tags_list,
                 is_bookmarked=(q.id in bookmarked_ids),
-                folder_path=get_folder_path_string(db, q.folder_id),
+                folder_path=get_folder_path_string(db, q.folder_id) if q.folder_id else "",
                 position=q.position or 0,
                 created_at=q.created_at,
                 updated_at=q.updated_at
@@ -196,7 +196,7 @@ def get_random_questions(
                 status=q.status,
                 tags=tags_list,
                 is_bookmarked=(q.id in bookmarked_ids),
-                folder_path=get_folder_path_string(db, q.folder_id),
+                folder_path=get_folder_path_string(db, q.folder_id) if q.folder_id else "",
                 position=q.position or 0,
                 created_at=q.created_at,
                 updated_at=q.updated_at
@@ -225,12 +225,15 @@ def create_question(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    folder = db.query(Folder).filter(
-        Folder.id == q_in.folder_id,
-        Folder.user_id == current_user.id
-    ).first()
-    if not folder:
-        raise HTTPException(status_code=404, detail="Folder not found")
+    actual_folder_id = None
+    if q_in.folder_id and q_in.folder_id.strip():
+        folder = db.query(Folder).filter(
+            Folder.id == q_in.folder_id.strip(),
+            Folder.user_id == current_user.id
+        ).first()
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        actual_folder_id = folder.id
 
     tags_str = json.dumps(q_in.tags or [])
 
@@ -239,13 +242,13 @@ def create_question(
     else:
         max_pos = db.query(func.max(Question.position)).filter(
             Question.user_id == current_user.id,
-            Question.folder_id == q_in.folder_id
+            Question.folder_id == actual_folder_id
         ).scalar()
         q_pos = (max_pos + 1) if max_pos is not None else 0
 
     question = Question(
         user_id=current_user.id,
-        folder_id=q_in.folder_id,
+        folder_id=actual_folder_id,
         title=q_in.title.strip(),
         problem_url=(q_in.problem_url or "").strip(),
         problem_statement=q_in.problem_statement or "",

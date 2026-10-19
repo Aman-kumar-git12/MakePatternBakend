@@ -6,7 +6,7 @@ from app.schemas.test_case import TestCaseResponse
 
 class QuestionBase(BaseModel):
     title: str
-    folder_id: str
+    folder_id: Optional[str] = None
     problem_url: Optional[str] = ""
     problem_statement: Optional[str] = ""
     notes: Optional[str] = ""
@@ -36,7 +36,7 @@ class QuestionMove(BaseModel):
 class QuestionResponse(BaseModel):
     id: str
     user_id: str
-    folder_id: str
+    folder_id: Optional[str] = None
     title: str
     problem_url: Optional[str] = ""
     problem_statement: str = ""
@@ -55,7 +55,7 @@ class QuestionResponse(BaseModel):
 
 class QuestionListItem(BaseModel):
     id: str
-    folder_id: str
+    folder_id: Optional[str] = None
     title: str
     problem_url: Optional[str] = ""
     difficulty: str
