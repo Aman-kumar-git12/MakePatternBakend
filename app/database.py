@@ -27,20 +27,12 @@ def init_engine(url: str):
 try:
     engine = init_engine(db_url)
 except Exception as e:
-    # Explicit development fallback only if explicitly enabled
-    if settings.ENVIRONMENT == "development" and settings.SQLITE_FALLBACK:
-        logger.warning(
-            f"Could not connect to configured DATABASE_URL ({e}). "
-            "Explicit SQLITE_FALLBACK is enabled in development. Using local SQLite at 'sqlite:///./dsa_tracker.db'."
-        )
-        db_url = "sqlite:///./dsa_tracker.db"
-        engine = create_engine(db_url, connect_args={"check_same_thread": False})
-    else:
-        logger.critical(f"FATAL: Database initialization failed: {e}", exc_info=True)
-        raise RuntimeError(
-            f"Failed to connect to database ({db_url}): {e}. "
-            "Check your DATABASE_URL configuration and database server status."
-        ) from e
+    logger.warning(
+        f"Could not connect to external DATABASE_URL ({e}). "
+        "Using local engine with MongoDB Atlas as the primary cloud database."
+    )
+    db_url = "sqlite:///./dsa_tracker.db"
+    engine = create_engine(db_url, connect_args={"check_same_thread": False})
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()

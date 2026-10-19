@@ -7,6 +7,7 @@ from app.models.question import Question
 from app.models.user import User
 from app.schemas.test_case import TestCaseCreate, TestCaseUpdate, TestCaseResponse
 from app.routers.auth import get_current_user
+from app.mongodb import save_test_case_mongo, delete_test_case_mongo
 
 router = APIRouter(prefix="/test-cases", tags=["test_cases"])
 
@@ -52,6 +53,7 @@ def create_test_case(
     db.add(tc)
     db.commit()
     db.refresh(tc)
+    save_test_case_mongo(tc)
     return tc
 
 @router.put("/{test_case_id}", response_model=TestCaseResponse)
@@ -81,6 +83,7 @@ def update_test_case(
 
     db.commit()
     db.refresh(tc)
+    save_test_case_mongo(tc)
     return tc
 
 @router.delete("/{test_case_id}")
@@ -98,4 +101,5 @@ def delete_test_case(
 
     db.delete(tc)
     db.commit()
+    delete_test_case_mongo(test_case_id)
     return {"message": "Test case deleted successfully", "id": test_case_id}

@@ -6,17 +6,22 @@ from typing import Optional
 class Settings(BaseSettings):
     ENVIRONMENT: str = "development"  # "development", "staging", "production"
     DATABASE_URL: str = "sqlite:///./dsa_tracker.db"
-    SQLITE_FALLBACK: bool = False
+    SQLITE_FALLBACK: bool = True
     JWT_SECRET: str = "dsa_tracker_super_secret_jwt_key_2026_change_in_production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     PORT: int = 8000
     HOST: str = "0.0.0.0"
-    CLIENT_URL: str = "http://localhost:5173"
-    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:3000"
+    CLIENT_URL: str = "https://make-pattern-dev.vercel.app"
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:3000,https://make-pattern-dev.vercel.app"
     ALLOW_DEV_FALLBACK_AUTH: bool = False
-    MONGODB_URL: str = "mongodb://localhost:27017"
+    MONGODB_URL: Optional[str] = None
+    MONGODB_URI: Optional[str] = "mongodb+srv://rajaman5562_db_user:7jKAFWoZA7m8kWAa@makepattern.lnprlgq.mongodb.net"
     MONGODB_DB_NAME: str = "dsa_tracker"
+
+    @property
+    def mongo_connection_uri(self) -> str:
+        return self.MONGODB_URI or self.MONGODB_URL or "mongodb+srv://rajaman5562_db_user:7jKAFWoZA7m8kWAa@makepattern.lnprlgq.mongodb.net"
 
     model_config = {
         "env_file": ".env",

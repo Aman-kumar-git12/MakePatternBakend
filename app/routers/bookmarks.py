@@ -8,6 +8,7 @@ from app.models.user import User
 from app.schemas.bookmark import BookmarkToggleResponse, BookmarkResponse
 from app.routers.auth import get_current_user
 from app.routers.questions import format_question_response
+from app.mongodb import save_bookmark_mongo, delete_bookmark_mongo
 
 router = APIRouter(prefix="/bookmarks", tags=["bookmarks"])
 
@@ -50,8 +51,10 @@ def toggle_bookmark(
     ).first()
 
     if existing:
+        b_id = existing.id
         db.delete(existing)
         db.commit()
+        delete_bookmark_mongo(bookmark_id=b_id, user_id=current_user.id, question_id=question_id)
         return BookmarkToggleResponse(
             question_id=question_id,
             is_bookmarked=False,
@@ -61,6 +64,7 @@ def toggle_bookmark(
         new_b = Bookmark(user_id=current_user.id, question_id=question_id)
         db.add(new_b)
         db.commit()
+        save_bookmark_mongo(new_b)
         return BookmarkToggleResponse(
             question_id=question_id,
             is_bookmarked=True,

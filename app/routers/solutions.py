@@ -14,6 +14,7 @@ from app.schemas.solution import (
 )
 from app.routers.auth import get_current_user
 from app.services.complexity_service import analyze_complexity, compute_code_hash
+from app.mongodb import save_solution_mongo, delete_solution_mongo
 
 router = APIRouter(prefix="/solutions", tags=["solutions"])
 
@@ -101,6 +102,7 @@ def create_solution(
     db.add(sol)
     db.commit()
     db.refresh(sol)
+    save_solution_mongo(sol)
     return sol
 
 @router.put("/{solution_id}", response_model=SolutionResponse)
@@ -160,6 +162,7 @@ def update_solution(
 
     db.commit()
     db.refresh(sol)
+    save_solution_mongo(sol)
     return sol
 
 @router.post("/{solution_id}/analyze", response_model=SolutionResponse)
@@ -191,6 +194,7 @@ def trigger_solution_analysis(
 
     db.commit()
     db.refresh(sol)
+    save_solution_mongo(sol)
     return sol
 
 @router.delete("/{solution_id}")
@@ -208,4 +212,5 @@ def delete_solution(
 
     db.delete(sol)
     db.commit()
+    delete_solution_mongo(solution_id)
     return {"message": "Solution deleted successfully", "id": solution_id}

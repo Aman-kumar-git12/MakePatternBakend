@@ -11,13 +11,26 @@ logger = logging.getLogger("dsa_tracker.mongodb")
 
 _mongo_client: Optional[pymongo.MongoClient] = None
 
+try:
+    import certifi
+    _CA_FILE = certifi.where()
+except Exception:
+    _CA_FILE = None
+
 def get_mongo_client() -> Optional[pymongo.MongoClient]:
     global _mongo_client
     if _mongo_client is None:
         try:
+            mongo_uri = settings.mongo_connection_uri
+            client_kwargs: Dict[str, Any] = {
+                "serverSelectionTimeoutMS": 5000
+            }
+            if _CA_FILE and ("mongodb+srv" in mongo_uri or "ssl=true" in mongo_uri.lower() or "tls=true" in mongo_uri.lower()):
+                client_kwargs["tlsCAFile"] = _CA_FILE
+
             _mongo_client = pymongo.MongoClient(
-                settings.MONGODB_URL,
-                serverSelectionTimeoutMS=2000
+                mongo_uri,
+                **client_kwargs
             )
             # Ping to verify active connection
             _mongo_client.admin.command('ping')
@@ -37,6 +50,36 @@ def get_users_collection() -> Optional[Collection]:
     db = get_mongo_db()
     if db is not None:
         return db["users"]
+    return None
+
+def get_folders_collection() -> Optional[Collection]:
+    db = get_mongo_db()
+    if db is not None:
+        return db["folders"]
+    return None
+
+def get_questions_collection() -> Optional[Collection]:
+    db = get_mongo_db()
+    if db is not None:
+        return db["questions"]
+    return None
+
+def get_solutions_collection() -> Optional[Collection]:
+    db = get_mongo_db()
+    if db is not None:
+        return db["solutions"]
+    return None
+
+def get_test_cases_collection() -> Optional[Collection]:
+    db = get_mongo_db()
+    if db is not None:
+        return db["test_cases"]
+    return None
+
+def get_bookmarks_collection() -> Optional[Collection]:
+    db = get_mongo_db()
+    if db is not None:
+        return db["bookmarks"]
     return None
 
 def init_mongodb():
@@ -127,6 +170,29 @@ def init_mongodb():
         # Ensure unique index on shared_patterns.share_id
         db.users.create_index("shared_patterns.share_id", unique=True, sparse=True, name="unique_share_id_idx")
         logger.info("MongoDB unique index on shared_patterns.share_id verified successfully.")
+
+        # Ensure indexes on folders collection
+        db.folders.create_index("id", unique=True, name="unique_folder_id_idx")
+        db.folders.create_index("user_id", name="folder_user_id_idx")
+        db.folders.create_index("parent_id", name="folder_parent_id_idx")
+
+        # Ensure indexes on questions collection
+        db.questions.create_index("id", unique=True, name="unique_question_id_idx")
+        db.questions.create_index("user_id", name="question_user_id_idx")
+        db.questions.create_index("folder_id", name="question_folder_id_idx")
+
+        # Ensure indexes on solutions collection
+        db.solutions.create_index("id", unique=True, name="unique_solution_id_idx")
+        db.solutions.create_index("question_id", name="solution_question_id_idx")
+
+        # Ensure indexes on test_cases collection
+        db.test_cases.create_index("id", unique=True, name="unique_test_case_id_idx")
+        db.test_cases.create_index("question_id", name="test_case_question_id_idx")
+
+        # Ensure indexes on bookmarks collection
+        db.bookmarks.create_index("id", unique=True, name="unique_bookmark_id_idx")
+        db.bookmarks.create_index([("user_id", 1), ("question_id", 1)], unique=True, name="unique_user_question_bookmark_idx")
+        logger.info("MongoDB indexes for folders, questions, solutions, test_cases, and bookmarks verified successfully.")
     except Exception as e:
         logger.error(f"Error initializing MongoDB collection or index: {e}", exc_info=True)
 
@@ -203,6 +269,451 @@ def sync_all_sqlite_users_to_mongo(users: List[Any]) -> None:
                 )
         except Exception as e:
             logger.warning(f"Error syncing user {getattr(u, 'id', None)} to MongoDB: {e}")
+
+# =========================================================================
+# Folders, Questions, Solutions, TestCases & Bookmarks Sync & CRUD Helpers
+# =========================================================================
+
+def folder_to_mongo_dict(f: Any) -> Dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": str(getattr(f, "id", "")),
+        "user_id": str(getattr(f, "user_id", "")),
+        "parent_id": str(getattr(f, "parent_id", "")) if getattr(f, "parent_id", None) else None,
+        "name": getattr(f, "name", ""),
+        "description": getattr(f, "description", "") or "",
+        "tags": getattr(f, "tags", "[]") or "[]",
+        "position": getattr(f, "position", 0) or 0,
+        "created_at": getattr(f, "created_at", None).isoformat() if getattr(f, "created_at", None) else now_iso,
+        "updated_at": getattr(f, "updated_at", None).isoformat() if getattr(f, "updated_at", None) else now_iso,
+    }
+
+def save_folder_mongo(folder: Any) -> bool:
+    try:
+        coll = get_folders_collection()
+        if coll is None:
+            return False
+        doc = folder_to_mongo_dict(folder) if hasattr(folder, "id") else folder
+        coll.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving folder to MongoDB: {e}")
+        return False
+
+def bulk_save_folders_mongo(folders: List[Any]) -> bool:
+    try:
+        coll = get_folders_collection()
+        if coll is None or not folders:
+            return False
+        operations = []
+        for f in folders:
+            doc = folder_to_mongo_dict(f) if hasattr(f, "id") else f
+            operations.append(pymongo.UpdateOne({"id": doc["id"]}, {"$set": doc}, upsert=True))
+        if operations:
+            coll.bulk_write(operations, ordered=False)
+        return True
+    except Exception as e:
+        logger.warning(f"Error bulk saving folders to MongoDB: {e}")
+        return False
+
+def delete_folder_mongo(folder_id: str, descendant_ids: Optional[List[str]] = None) -> bool:
+    try:
+        db = get_mongo_db()
+        if db is None:
+            return False
+        target_ids = [folder_id]
+        if descendant_ids:
+            target_ids.extend(descendant_ids)
+        target_ids = list(set(target_ids))
+
+        # Find questions under these folders to delete associated items
+        qs = list(db.questions.find({"folder_id": {"$in": target_ids}}, {"id": 1}))
+        q_ids = [q["id"] for q in qs]
+
+        db.folders.delete_many({"id": {"$in": target_ids}})
+        if q_ids:
+            db.questions.delete_many({"id": {"$in": q_ids}})
+            db.solutions.delete_many({"question_id": {"$in": q_ids}})
+            db.test_cases.delete_many({"question_id": {"$in": q_ids}})
+            db.bookmarks.delete_many({"question_id": {"$in": q_ids}})
+        return True
+    except Exception as e:
+        logger.warning(f"Error deleting folder from MongoDB: {e}")
+        return False
+
+def question_to_mongo_dict(q: Any) -> Dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": str(getattr(q, "id", "")),
+        "user_id": str(getattr(q, "user_id", "")),
+        "folder_id": str(getattr(q, "folder_id", "")) if getattr(q, "folder_id", None) else None,
+        "title": getattr(q, "title", ""),
+        "problem_url": getattr(q, "problem_url", "") or "",
+        "problem_statement": getattr(q, "problem_statement", "") or "",
+        "notes": getattr(q, "notes", "") or "",
+        "difficulty": getattr(q, "difficulty", "Medium") or "Medium",
+        "status": getattr(q, "status", "Not Started") or "Not Started",
+        "tags": getattr(q, "tags", "[]") or "[]",
+        "position": getattr(q, "position", 0) or 0,
+        "created_at": getattr(q, "created_at", None).isoformat() if getattr(q, "created_at", None) else now_iso,
+        "updated_at": getattr(q, "updated_at", None).isoformat() if getattr(q, "updated_at", None) else now_iso,
+    }
+
+def save_question_mongo(question: Any) -> bool:
+    try:
+        coll = get_questions_collection()
+        if coll is None:
+            return False
+        doc = question_to_mongo_dict(question) if hasattr(question, "id") else question
+        coll.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving question to MongoDB: {e}")
+        return False
+
+def bulk_save_questions_mongo(questions: List[Any]) -> bool:
+    try:
+        coll = get_questions_collection()
+        if coll is None or not questions:
+            return False
+        operations = []
+        for q in questions:
+            doc = question_to_mongo_dict(q) if hasattr(q, "id") else q
+            operations.append(pymongo.UpdateOne({"id": doc["id"]}, {"$set": doc}, upsert=True))
+        if operations:
+            coll.bulk_write(operations, ordered=False)
+        return True
+    except Exception as e:
+        logger.warning(f"Error bulk saving questions to MongoDB: {e}")
+        return False
+
+def delete_question_mongo(question_id: str) -> bool:
+    try:
+        db = get_mongo_db()
+        if db is None:
+            return False
+        db.questions.delete_one({"id": question_id})
+        db.solutions.delete_many({"question_id": question_id})
+        db.test_cases.delete_many({"question_id": question_id})
+        db.bookmarks.delete_many({"question_id": question_id})
+        return True
+    except Exception as e:
+        logger.warning(f"Error deleting question from MongoDB: {e}")
+        return False
+
+def solution_to_mongo_dict(s: Any) -> Dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": str(getattr(s, "id", "")),
+        "question_id": str(getattr(s, "question_id", "")),
+        "title": getattr(s, "title", "Solution") or "Solution",
+        "solution_type": getattr(s, "solution_type", "Optimized") or "Optimized",
+        "language": getattr(s, "language", "cpp") or "cpp",
+        "code": getattr(s, "code", "") or "",
+        "explanation": getattr(s, "explanation", "") or "",
+        "time_complexity": getattr(s, "time_complexity", "") or "",
+        "space_complexity": getattr(s, "space_complexity", "") or "",
+        "position": getattr(s, "position", 0) or 0,
+        "created_at": getattr(s, "created_at", None).isoformat() if getattr(s, "created_at", None) else now_iso,
+        "updated_at": getattr(s, "updated_at", None).isoformat() if getattr(s, "updated_at", None) else now_iso,
+    }
+
+def save_solution_mongo(solution: Any) -> bool:
+    try:
+        coll = get_solutions_collection()
+        if coll is None:
+            return False
+        doc = solution_to_mongo_dict(solution) if hasattr(solution, "id") else solution
+        coll.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving solution to MongoDB: {e}")
+        return False
+
+def delete_solution_mongo(solution_id: str) -> bool:
+    try:
+        coll = get_solutions_collection()
+        if coll is None:
+            return False
+        coll.delete_one({"id": solution_id})
+        return True
+    except Exception as e:
+        logger.warning(f"Error deleting solution from MongoDB: {e}")
+        return False
+
+def test_case_to_mongo_dict(tc: Any) -> Dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": str(getattr(tc, "id", "")),
+        "question_id": str(getattr(tc, "question_id", "")),
+        "title": getattr(tc, "title", "Test Case") or "Test Case",
+        "input": getattr(tc, "input", "") or "",
+        "expected_output": getattr(tc, "expected_output", "") or "",
+        "notes": getattr(tc, "notes", "") or "",
+        "position": getattr(tc, "position", 0) or 0,
+        "created_at": getattr(tc, "created_at", None).isoformat() if getattr(tc, "created_at", None) else now_iso,
+        "updated_at": getattr(tc, "updated_at", None).isoformat() if getattr(tc, "updated_at", None) else now_iso,
+    }
+
+def save_test_case_mongo(test_case: Any) -> bool:
+    try:
+        coll = get_test_cases_collection()
+        if coll is None:
+            return False
+        doc = test_case_to_mongo_dict(test_case) if hasattr(test_case, "id") else test_case
+        coll.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving test case to MongoDB: {e}")
+        return False
+
+def delete_test_case_mongo(test_case_id: str) -> bool:
+    try:
+        coll = get_test_cases_collection()
+        if coll is None:
+            return False
+        coll.delete_one({"id": test_case_id})
+        return True
+    except Exception as e:
+        logger.warning(f"Error deleting test case from MongoDB: {e}")
+        return False
+
+def bookmark_to_mongo_dict(b: Any) -> Dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": str(getattr(b, "id", "")),
+        "user_id": str(getattr(b, "user_id", "")),
+        "question_id": str(getattr(b, "question_id", "")),
+        "created_at": getattr(b, "created_at", None).isoformat() if getattr(b, "created_at", None) else now_iso,
+    }
+
+def save_bookmark_mongo(bookmark: Any) -> bool:
+    try:
+        coll = get_bookmarks_collection()
+        if coll is None:
+            return False
+        doc = bookmark_to_mongo_dict(bookmark) if hasattr(bookmark, "id") else bookmark
+        coll.update_one(
+            {"user_id": doc["user_id"], "question_id": doc["question_id"]},
+            {"$set": doc},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving bookmark to MongoDB: {e}")
+        return False
+
+def delete_bookmark_mongo(bookmark_id: Optional[str] = None, user_id: Optional[str] = None, question_id: Optional[str] = None) -> bool:
+    try:
+        coll = get_bookmarks_collection()
+        if coll is None:
+            return False
+        query = {}
+        if bookmark_id:
+            query["id"] = bookmark_id
+        if user_id:
+            query["user_id"] = user_id
+        if question_id:
+            query["question_id"] = question_id
+        if not query:
+            return False
+        coll.delete_one(query)
+        return True
+    except Exception as e:
+        logger.warning(f"Error deleting bookmark from MongoDB: {e}")
+        return False
+
+def sync_all_sqlite_data_to_mongo(db: Any) -> Dict[str, int]:
+    """
+    Synchronizes all data from SQLite (users, folders, questions, solutions,
+    test_cases, bookmarks) into MongoDB collections.
+    """
+    from app.models.user import User as SqlUser
+    from app.models.folder import Folder as SqlFolder
+    from app.models.question import Question as SqlQuestion
+    from app.models.solution import Solution as SqlSolution
+    from app.models.test_case import TestCase as SqlTestCase
+    from app.models.bookmark import Bookmark as SqlBookmark
+
+    stats = {"users": 0, "folders": 0, "questions": 0, "solutions": 0, "test_cases": 0, "bookmarks": 0}
+
+    # 1. Users
+    users = db.query(SqlUser).all()
+    sync_all_sqlite_users_to_mongo(users)
+    stats["users"] = len(users)
+
+    # 2. Folders
+    folders = db.query(SqlFolder).all()
+    bulk_save_folders_mongo(folders)
+    stats["folders"] = len(folders)
+
+    # 3. Questions
+    questions = db.query(SqlQuestion).all()
+    bulk_save_questions_mongo(questions)
+    stats["questions"] = len(questions)
+
+    # 4. Solutions
+    solutions = db.query(SqlSolution).all()
+    for s in solutions:
+        save_solution_mongo(s)
+    stats["solutions"] = len(solutions)
+
+    # 5. TestCases
+    test_cases = db.query(SqlTestCase).all()
+    for tc in test_cases:
+        save_test_case_mongo(tc)
+    stats["test_cases"] = len(test_cases)
+
+    # 6. Bookmarks
+    bookmarks = db.query(SqlBookmark).all()
+    for b in bookmarks:
+        save_bookmark_mongo(b)
+    stats["bookmarks"] = len(bookmarks)
+
+    logger.info(f"MongoDB Full Synchronization Complete: {stats}")
+    return stats
+
+def restore_all_data_from_mongo_to_sqlite(db: Any) -> Dict[str, int]:
+    """
+    If SQLite database is empty (e.g. running on Render's ephemeral filesystem or clean deploy),
+    automatically restores all users, folders, questions, solutions, test cases, and bookmarks
+    directly from MongoDB Atlas. This ensures MongoDB Atlas is the true, permanent cloud database.
+    """
+    from app.models.user import User as SqlUser
+    from app.models.folder import Folder as SqlFolder
+    from app.models.question import Question as SqlQuestion
+    from app.models.solution import Solution as SqlSolution
+    from app.models.test_case import TestCase as SqlTestCase
+    from app.models.bookmark import Bookmark as SqlBookmark
+
+    mongo_db = get_mongo_db()
+    if mongo_db is None:
+        logger.warning("MongoDB not connected; skipping restore.")
+        return {}
+
+    stats = {"users": 0, "folders": 0, "questions": 0, "solutions": 0, "test_cases": 0, "bookmarks": 0}
+
+    existing_user_count = db.query(SqlUser).count()
+    mongo_users = list(mongo_db.users.find({}))
+
+    if existing_user_count == 0 and len(mongo_users) > 0:
+        logger.info(f"Local storage is empty. Restoring {len(mongo_users)} users and complete curriculum from MongoDB Atlas...")
+
+        # 1. Restore Users
+        for u in mongo_users:
+            uid = u.get("id") or str(u.get("_id"))
+            sql_u = SqlUser(
+                id=uid,
+                email=u.get("email"),
+                hashed_password=u.get("hashed_password"),
+                full_name=u.get("full_name") or "Aman Kumar",
+            )
+            db.merge(sql_u)
+            stats["users"] += 1
+        db.commit()
+
+        # 2. Restore Folders
+        mongo_folders = list(mongo_db.folders.find({}))
+        # Sort folders by depth so parents are inserted before children
+        def folder_depth(f):
+            d = 0
+            pid = f.get("parent_id")
+            visited = set()
+            while pid and pid not in visited:
+                visited.add(pid)
+                parent = mongo_db.folders.find_one({"id": pid})
+                if not parent:
+                    break
+                pid = parent.get("parent_id")
+                d += 1
+            return d
+
+        mongo_folders.sort(key=folder_depth)
+        for f in mongo_folders:
+            sql_f = SqlFolder(
+                id=f.get("id") or str(f.get("_id")),
+                user_id=f.get("user_id"),
+                name=f.get("name"),
+                description=f.get("description"),
+                parent_id=f.get("parent_id"),
+                position=f.get("position", 0),
+                tags=f.get("tags", []),
+            )
+            db.merge(sql_f)
+            stats["folders"] += 1
+        db.commit()
+
+        # 3. Restore Questions
+        mongo_questions = list(mongo_db.questions.find({}))
+        for q in mongo_questions:
+            sql_q = SqlQuestion(
+                id=q.get("id") or str(q.get("_id")),
+                user_id=q.get("user_id"),
+                folder_id=q.get("folder_id"),
+                title=q.get("title"),
+                difficulty=q.get("difficulty", "Medium"),
+                status=q.get("status", "Not Started"),
+                problem_url=q.get("problem_url"),
+                position=q.get("position", 0),
+            )
+            db.merge(sql_q)
+            stats["questions"] += 1
+        db.commit()
+
+        # 4. Restore Solutions
+        mongo_solutions = list(mongo_db.solutions.find({}))
+        for s in mongo_solutions:
+            sql_s = SqlSolution(
+                id=s.get("id") or str(s.get("_id")),
+                question_id=s.get("question_id"),
+                title=s.get("title"),
+                approach_type=s.get("approach_type"),
+                code=s.get("code"),
+                language=s.get("language", "cpp"),
+                time_complexity=s.get("time_complexity"),
+                space_complexity=s.get("space_complexity"),
+                notes=s.get("notes"),
+                position=s.get("position", 0),
+            )
+            db.merge(sql_s)
+            stats["solutions"] += 1
+        db.commit()
+
+        # 5. Restore TestCases
+        mongo_tc = list(mongo_db.test_cases.find({}))
+        for tc in mongo_tc:
+            sql_tc = SqlTestCase(
+                id=tc.get("id") or str(tc.get("_id")),
+                question_id=tc.get("question_id"),
+                input_data=tc.get("input_data"),
+                expected_output=tc.get("expected_output"),
+                explanation=tc.get("explanation"),
+                is_sample=tc.get("is_sample", False),
+            )
+            db.merge(sql_tc)
+            stats["test_cases"] += 1
+        db.commit()
+
+        # 6. Restore Bookmarks
+        mongo_bm = list(mongo_db.bookmarks.find({}))
+        for b in mongo_bm:
+            sql_b = SqlBookmark(
+                id=b.get("id") or str(b.get("_id")),
+                user_id=b.get("user_id"),
+                question_id=b.get("question_id"),
+            )
+            db.merge(sql_b)
+            stats["bookmarks"] += 1
+        db.commit()
+
+        logger.info(f"MongoDB Restore Complete: {stats}")
+    else:
+        # Local storage already has data; sync any changes to Mongo
+        stats = sync_all_sqlite_data_to_mongo(db)
+        logger.info(f"MongoDB Sync Verified: {stats}")
+
+    return stats
+
 
 # =========================================================================
 # Pattern Sharing Persistence & Security Helpers

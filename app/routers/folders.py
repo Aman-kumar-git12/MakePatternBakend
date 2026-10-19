@@ -12,7 +12,8 @@ from app.schemas.folder import (
 )
 from app.mongodb import (
     get_share_for_folder_mongo, create_or_get_share_mongo,
-    update_share_status_mongo, revoke_share_mongo
+    update_share_status_mongo, revoke_share_mongo,
+    save_folder_mongo, bulk_save_folders_mongo, delete_folder_mongo
 )
 from app.routers.auth import get_current_user
 from app.services.folder_service import (
@@ -66,6 +67,7 @@ def create_folder(
     db.add(folder)
     db.commit()
     db.refresh(folder)
+    save_folder_mongo(folder)
 
     parsed_tags = []
     try:
@@ -102,6 +104,8 @@ def reorder_folders(
             Folder.user_id == current_user.id
         ).update({"position": item.position})
     db.commit()
+    reordered_folders = db.query(Folder).filter(Folder.id.in_([it.id for it in items])).all()
+    bulk_save_folders_mongo(reordered_folders)
     return {"message": "Folders reordered successfully"}
 
 @router.put("/{folder_id}", response_model=FolderTreeResponse)
@@ -142,6 +146,7 @@ def update_folder(
 
     db.commit()
     db.refresh(folder)
+    save_folder_mongo(folder)
 
     parsed_tags = []
     try:
@@ -197,6 +202,8 @@ def move_folder(
         folder.position = move_in.new_position
 
     db.commit()
+    db.refresh(folder)
+    save_folder_mongo(folder)
     return {"message": "Folder moved successfully", "folder_id": folder.id, "parent_id": folder.parent_id}
 
 @router.delete("/{folder_id}")
@@ -218,6 +225,7 @@ def delete_folder(
     # Delete folder (SQLAlchemy cascading will delete descendant folders & questions)
     db.delete(folder)
     db.commit()
+    delete_folder_mongo(folder_id, list(descendant_ids))
 
     return {"message": "Folder and contents deleted successfully", "deleted_folder_ids": list(all_target_ids)}
 

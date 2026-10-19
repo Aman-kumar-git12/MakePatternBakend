@@ -16,9 +16,13 @@ from app.schemas.question import (
     QuestionListItem
 )
 from app.schemas.solution import SolutionResponse
-from app.schemas.folder import ReorderItem
 from app.routers.auth import get_current_user
 from app.services.folder_service import get_folder_path_string
+from app.mongodb import (
+    save_question_mongo,
+    bulk_save_questions_mongo,
+    delete_question_mongo
+)
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
@@ -261,6 +265,7 @@ def create_question(
     db.add(question)
     db.commit()
     db.refresh(question)
+    save_question_mongo(question)
 
     return format_question_response(db, question, current_user.id)
 
@@ -276,6 +281,8 @@ def reorder_questions(
             Question.user_id == current_user.id
         ).update({"position": item.position})
     db.commit()
+    reordered_qs = db.query(Question).filter(Question.id.in_([it.id for it in items])).all()
+    bulk_save_questions_mongo(reordered_qs)
     return {"message": "Questions reordered successfully"}
 
 @router.put("/{question_id}", response_model=QuestionResponse)
@@ -319,6 +326,7 @@ def update_question(
 
     db.commit()
     db.refresh(q)
+    save_question_mongo(q)
     return format_question_response(db, q, current_user.id)
 
 @router.post("/{question_id}/move")
@@ -347,6 +355,8 @@ def move_question(
         q.position = move_in.new_position
 
     db.commit()
+    db.refresh(q)
+    save_question_mongo(q)
     return {"message": "Question moved successfully", "question_id": q.id, "folder_id": q.folder_id}
 
 @router.delete("/{question_id}")
@@ -364,4 +374,5 @@ def delete_question(
 
     db.delete(q)
     db.commit()
+    delete_question_mongo(question_id)
     return {"message": "Question deleted successfully", "id": question_id}

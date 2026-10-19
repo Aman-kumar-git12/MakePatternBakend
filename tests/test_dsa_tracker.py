@@ -128,3 +128,90 @@ def test_global_search(client):
     data = res.json()
     assert "questions" in data
     assert any("Two" in q["title"] for q in data["questions"])
+
+def test_mongodb_sync_integration(client):
+    from app.mongodb import (
+        get_folders_collection,
+        get_questions_collection,
+        get_solutions_collection,
+        get_test_cases_collection,
+        get_bookmarks_collection
+    )
+    folders_col = get_folders_collection()
+    questions_col = get_questions_collection()
+    solutions_col = get_solutions_collection()
+    test_cases_col = get_test_cases_collection()
+    bookmarks_col = get_bookmarks_collection()
+
+    if folders_col is None:
+        pytest.skip("MongoDB not running in test environment")
+
+    # 1. Test Folder MongoDB sync
+    f_res = client.post("/api/folders/", json={"name": "Mongo Sync Test Folder", "position": 100})
+    assert f_res.status_code == 201
+    f_data = f_res.json()
+    f_id = f_data["id"]
+    mongo_folder = folders_col.find_one({"id": f_id})
+    assert mongo_folder is not None
+    assert mongo_folder["name"] == "Mongo Sync Test Folder"
+
+    # 2. Test Question MongoDB sync
+    q_res = client.post("/api/questions/", json={
+        "folder_id": f_id,
+        "title": "Mongo Sync Test Question",
+        "difficulty": "Hard",
+        "status": "In Progress"
+    })
+    assert q_res.status_code == 201
+    q_data = q_res.json()
+    q_id = q_data["id"]
+    mongo_q = questions_col.find_one({"id": q_id})
+    assert mongo_q is not None
+    assert mongo_q["title"] == "Mongo Sync Test Question"
+    assert mongo_q["difficulty"] == "Hard"
+
+    # 3. Test Solution MongoDB sync
+    sol_res = client.post(f"/api/solutions/question/{q_id}", json={
+        "title": "Mongo Optimized Solution",
+        "language": "python",
+        "code": "def solve(): return 42"
+    })
+    assert sol_res.status_code == 201
+    sol_data = sol_res.json()
+    sol_id = sol_data["id"]
+    mongo_sol = solutions_col.find_one({"id": sol_id})
+    assert mongo_sol is not None
+    assert mongo_sol["title"] == "Mongo Optimized Solution"
+
+    # 4. Test TestCase MongoDB sync
+    tc_res = client.post(f"/api/test-cases/question/{q_id}", json={
+        "title": "Sample TC 1",
+        "input": "[1, 2, 3]",
+        "expected_output": "6"
+    })
+    assert tc_res.status_code == 201
+    tc_data = tc_res.json()
+    tc_id = tc_data["id"]
+    mongo_tc = test_cases_col.find_one({"id": tc_id})
+    assert mongo_tc is not None
+    assert mongo_tc["input"] == "[1, 2, 3]"
+
+    # 5. Test Bookmark MongoDB sync
+    bm_res = client.post(f"/api/bookmarks/{q_id}/toggle")
+    assert bm_res.status_code == 200
+    mongo_bm = bookmarks_col.find_one({"question_id": q_id})
+    assert mongo_bm is not None
+
+    bm_untoggle = client.post(f"/api/bookmarks/{q_id}/toggle")
+    assert bm_untoggle.status_code == 200
+    mongo_bm_after = bookmarks_col.find_one({"question_id": q_id})
+    assert mongo_bm_after is None
+
+    # 6. Cleanup via folder delete (which cascades to question, solutions, test cases)
+    del_folder = client.delete(f"/api/folders/{f_id}")
+    assert del_folder.status_code == 200
+    assert folders_col.find_one({"id": f_id}) is None
+    assert questions_col.find_one({"id": q_id}) is None
+    assert solutions_col.find_one({"id": sol_id}) is None
+    assert test_cases_col.find_one({"id": tc_id}) is None
+

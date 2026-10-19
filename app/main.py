@@ -24,14 +24,12 @@ async def lifespan(app: FastAPI):
     # Initialize MongoDB connection and indexes
     try:
         init_mongodb()
-        # Automatically sync existing SQLite users to MongoDB
-        from app.models.user import User as SqlUser
-        from app.mongodb import sync_all_sqlite_users_to_mongo
+        # Connect and restore/verify data from MongoDB Atlas
+        from app.mongodb import restore_all_data_from_mongo_to_sqlite
         db = SessionLocal()
         try:
-            sql_users = db.query(SqlUser).all()
-            sync_all_sqlite_users_to_mongo(sql_users)
-            logger.info(f"Successfully verified/synced {len(sql_users)} users to MongoDB.")
+            stats = restore_all_data_from_mongo_to_sqlite(db)
+            logger.info(f"MongoDB cloud persistence active: {stats}")
         finally:
             db.close()
     except Exception as e:
@@ -46,19 +44,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS strictly to permitted frontend origins (no wildcard with credentials)
-raw_origins = [settings.CLIENT_URL]
+# Configure CORS dynamically for local dev, Vercel deployments, and custom domains
+raw_origins = [settings.CLIENT_URL, "https://make-pattern-dev.vercel.app"]
 if hasattr(settings, "CORS_ORIGINS") and settings.CORS_ORIGINS:
-    raw_origins.extend([o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()])
+    raw_origins.extend([o.strip().rstrip("/") for o in settings.CORS_ORIGINS.split(",") if o.strip()])
 
 # Filter unique valid origins and strictly exclude "*"
-allowed_origins = sorted(list({origin for origin in raw_origins if origin and origin != "*"}))
+allowed_origins = sorted(list({origin.rstrip("/") for origin in raw_origins if origin and origin != "*"}))
 logger.info(f"Configured CORS allowed origins: {allowed_origins}")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
+    allow_origin_regex=r"^https?://([a-zA-Z0-9_\-]+\.)*vercel\.app$|^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,6 +72,9 @@ app.include_router(progress.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(test_cases.router, prefix="/api")
 app.include_router(shared.router, prefix="/api")
+
+# Also include auth directly so requests to /auth/register and /auth/login work even if /api prefix is omitted
+app.include_router(auth.router)
 
 
 @app.get("/api/health")
