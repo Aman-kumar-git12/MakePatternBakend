@@ -1,216 +1,154 @@
+from typing import Any, Dict, List
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from typing import List
-from app.database import get_db
-from app.models.solution import Solution
-from app.models.question import Question
-from app.models.user import User
+from pymongo.database import Database
+
+from app.db import get_db, new_id, now_iso
+from app.routers.auth import CurrentUser, get_current_user
 from app.schemas.solution import (
-    SolutionCreate,
-    SolutionUpdate,
-    SolutionResponse,
     AnalyzeComplexityRequest,
-    AnalyzeComplexityResponse
+    AnalyzeComplexityResponse,
+    SolutionCreate,
+    SolutionResponse,
+    SolutionUpdate,
 )
-from app.routers.auth import get_current_user
 from app.services.complexity_service import analyze_complexity, compute_code_hash
-from app.mongodb import save_solution_mongo, delete_solution_mongo
+from app.services.repo import _sort_children, get_owned_question, next_position, to_solution
 
 router = APIRouter(prefix="/solutions", tags=["solutions"])
 
+MAX_SOLUTIONS_PER_QUESTION = 50
+
+
+def _owned_solution(db: Database, user_id: str, solution_id: str) -> Dict[str, Any]:
+    sol = db.solutions.find_one({"id": solution_id}, {"_id": 0})
+    if not sol or not get_owned_question(db, user_id, sol.get("question_id", "")):
+        raise HTTPException(status_code=404, detail="Solution not found")
+    return sol
+
+
 @router.post("/analyze-complexity", response_model=AnalyzeComplexityResponse)
-def analyze_solution_code(
-    payload: AnalyzeComplexityRequest,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Analyzes code complexity on-demand without saving.
-    Returns estimated time & space complexity, explanation, and status.
-    """
-    analysis = analyze_complexity(payload.code, payload.language)
+def analyze_solution_code(payload: AnalyzeComplexityRequest, current_user: CurrentUser = Depends(get_current_user)):
+    a = analyze_complexity(payload.code, payload.language)
     return AnalyzeComplexityResponse(
-        time_complexity=analysis["time_complexity"],
-        space_complexity=analysis["space_complexity"],
-        explanation=analysis["explanation"],
-        status=analysis["status"],
-        code_hash=analysis["code_hash"]
+        time_complexity=a["time_complexity"], space_complexity=a["space_complexity"],
+        explanation=a["explanation"], status=a["status"], code_hash=a["code_hash"],
     )
 
+
 @router.get("/question/{question_id}", response_model=List[SolutionResponse])
-def get_solutions_for_question(
-    question_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not q:
+def get_solutions_for_question(question_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    if not get_owned_question(db, current_user.id, question_id):
         raise HTTPException(status_code=404, detail="Question not found")
+    return [to_solution(s) for s in _sort_children(list(db.solutions.find({"question_id": question_id}, {"_id": 0})))]
 
-    solutions = db.query(Solution).filter(
-        Solution.question_id == question_id
-    ).order_by(Solution.position, Solution.created_at).all()
-
-    return solutions
 
 @router.post("/question/{question_id}", response_model=SolutionResponse, status_code=status.HTTP_201_CREATED)
-def create_solution(
-    question_id: str,
-    sol_in: SolutionCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not q:
+def create_solution(question_id: str, sol_in: SolutionCreate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    if not get_owned_question(db, current_user.id, question_id):
         raise HTTPException(status_code=404, detail="Question not found")
+    if db.solutions.count_documents({"question_id": question_id}) >= MAX_SOLUTIONS_PER_QUESTION:
+        raise HTTPException(status_code=400, detail=f"A question can have at most {MAX_SOLUTIONS_PER_QUESTION} solutions.")
 
     code = sol_in.code or ""
     language = sol_in.language or "python"
+    a = analyze_complexity(code, language)
+    now = now_iso()
+    doc = {
+        "id": new_id(),
+        "question_id": question_id,
+        "user_id": current_user.id,
+        "title": sol_in.title or "Optimized Approach",
+        "solution_type": sol_in.solution_type or "Optimized",
+        "language": language,
+        "code": code,
+        "explanation": sol_in.explanation or "",
+        "time_complexity_estimate": a["time_complexity"],
+        "space_complexity_estimate": a["space_complexity"],
+        "manual_time_complexity": sol_in.manual_time_complexity,
+        "manual_space_complexity": sol_in.manual_space_complexity,
+        # Time complexity is left for the user to state themselves.
+        "time_complexity": sol_in.manual_time_complexity or sol_in.time_complexity or "",
+        "space_complexity": sol_in.manual_space_complexity or sol_in.space_complexity or a["space_complexity"],
+        "analysis_explanation": a["explanation"],
+        "analysis_status": a["status"],
+        "analyzed_code_hash": a["code_hash"],
+        "position": sol_in.position if sol_in.position is not None else next_position(db, "solutions", {"question_id": question_id}),
+        "created_at": now,
+        "updated_at": now,
+    }
+    db.solutions.insert_one(doc)
+    doc.pop("_id", None)
+    db.questions.update_one({"id": question_id}, {"$set": {"updated_at": now}})
+    return to_solution(doc)
 
-    # Analyze complexity
-    analysis = analyze_complexity(code, language)
-    est_time = analysis["time_complexity"]
-    est_space = analysis["space_complexity"]
-
-    # Time complexity is left empty for user to provide themselves
-    eff_time = sol_in.manual_time_complexity or sol_in.time_complexity or ""
-    eff_space = sol_in.manual_space_complexity or sol_in.space_complexity or est_space
-
-    sol = Solution(
-        question_id=question_id,
-        title=sol_in.title or "Optimized Approach",
-        solution_type=sol_in.solution_type or "Optimized",
-        language=language,
-        code=code,
-        explanation=sol_in.explanation or "",
-        time_complexity_estimate=est_time,
-        space_complexity_estimate=est_space,
-        manual_time_complexity=sol_in.manual_time_complexity,
-        manual_space_complexity=sol_in.manual_space_complexity,
-        time_complexity=eff_time,
-        space_complexity=eff_space,
-        analysis_explanation=analysis["explanation"],
-        analysis_status=analysis["status"],
-        analyzed_code_hash=analysis["code_hash"],
-        position=sol_in.position or 0
-    )
-    db.add(sol)
-    db.commit()
-    db.refresh(sol)
-    save_solution_mongo(sol)
-    return sol
 
 @router.put("/{solution_id}", response_model=SolutionResponse)
-def update_solution(
-    solution_id: str,
-    sol_in: SolutionUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    sol = db.query(Solution).join(Question).filter(
-        Solution.id == solution_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not sol:
-        raise HTTPException(status_code=404, detail="Solution not found")
-
-    if sol_in.title is not None:
-        sol.title = sol_in.title
-    if sol_in.solution_type is not None:
-        sol.solution_type = sol_in.solution_type
-    if sol_in.language is not None:
-        sol.language = sol_in.language
-    if sol_in.explanation is not None:
-        sol.explanation = sol_in.explanation
-    if sol_in.position is not None:
-        sol.position = sol_in.position
-
-    # Check if manual override was changed
+def update_solution(solution_id: str, sol_in: SolutionUpdate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    sol = _owned_solution(db, current_user.id, solution_id)
+    u: Dict[str, Any] = {}
+    for field in ("title", "solution_type", "language", "explanation", "position"):
+        val = getattr(sol_in, field)
+        if val is not None:
+            u[field] = val
     if sol_in.manual_time_complexity is not None:
-        sol.manual_time_complexity = sol_in.manual_time_complexity or None
+        u["manual_time_complexity"] = sol_in.manual_time_complexity or None
     if sol_in.manual_space_complexity is not None:
-        sol.manual_space_complexity = sol_in.manual_space_complexity or None
-
-    # Handle code update & complexity re-analysis
+        u["manual_space_complexity"] = sol_in.manual_space_complexity or None
     if sol_in.code is not None:
-        new_hash = compute_code_hash(sol_in.code)
-        if new_hash != getattr(sol, 'analyzed_code_hash', ''):
-            # Code modified -> re-run static analysis
-            analysis = analyze_complexity(sol_in.code, sol.language)
-            sol.time_complexity_estimate = analysis["time_complexity"]
-            sol.space_complexity_estimate = analysis["space_complexity"]
-            sol.analysis_explanation = analysis["explanation"]
-            sol.analysis_status = analysis["status"]
-            sol.analyzed_code_hash = analysis["code_hash"]
-        sol.code = sol_in.code
+        if compute_code_hash(sol_in.code.strip()) != (sol.get("analyzed_code_hash") or ""):
+            a = analyze_complexity(sol_in.code, u.get("language") or sol.get("language") or "python")
+            u.update({
+                "time_complexity_estimate": a["time_complexity"],
+                "space_complexity_estimate": a["space_complexity"],
+                "analysis_explanation": a["explanation"],
+                "analysis_status": a["status"],
+                "analyzed_code_hash": a["code_hash"],
+            })
+        u["code"] = sol_in.code
 
-    # If explicit time/space passed
+    merged = {**sol, **u}
     if sol_in.time_complexity is not None:
-        sol.time_complexity = sol_in.time_complexity
-    else:
-        sol.time_complexity = sol.manual_time_complexity or sol.time_complexity or ""
-
+        u["time_complexity"] = sol_in.time_complexity
+    elif "manual_time_complexity" in u:
+        # Clearing the manual value falls back to the analysed estimate, not the stale stored value
+        # (which is the manual value being removed).
+        u["time_complexity"] = merged.get("manual_time_complexity") or merged.get("time_complexity_estimate") or ""
     if sol_in.space_complexity is not None:
-        sol.space_complexity = sol_in.space_complexity
-    else:
-        sol.space_complexity = sol.manual_space_complexity or sol.space_complexity_estimate or "O(1)"
+        u["space_complexity"] = sol_in.space_complexity
+    elif "manual_space_complexity" in u or "space_complexity_estimate" in u:
+        u["space_complexity"] = merged.get("manual_space_complexity") or merged.get("space_complexity_estimate") or "O(1)"
 
-    db.commit()
-    db.refresh(sol)
-    save_solution_mongo(sol)
-    return sol
+    if u:
+        now = now_iso()
+        u["updated_at"] = now
+        db.solutions.update_one({"id": solution_id}, {"$set": u})
+        db.questions.update_one({"id": sol["question_id"]}, {"$set": {"updated_at": now}})
+        sol.update(u)
+    return to_solution(sol)
+
 
 @router.post("/{solution_id}/analyze", response_model=SolutionResponse)
-def trigger_solution_analysis(
-    solution_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Re-runs analysis on an existing saved solution.
-    """
-    sol = db.query(Solution).join(Question).filter(
-        Solution.id == solution_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not sol:
-        raise HTTPException(status_code=404, detail="Solution not found")
+def trigger_solution_analysis(solution_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    sol = _owned_solution(db, current_user.id, solution_id)
+    a = analyze_complexity(sol.get("code") or "", sol.get("language") or "python")
+    u = {
+        "time_complexity_estimate": a["time_complexity"],
+        "space_complexity_estimate": a["space_complexity"],
+        "analysis_explanation": a["explanation"],
+        "analysis_status": a["status"],
+        "analyzed_code_hash": a["code_hash"],
+        "updated_at": now_iso(),
+    }
+    if not sol.get("manual_space_complexity"):
+        u["space_complexity"] = a["space_complexity"]
+    db.solutions.update_one({"id": solution_id}, {"$set": u})
+    sol.update(u)
+    return to_solution(sol)
 
-    analysis = analyze_complexity(sol.code or "", sol.language)
-    sol.time_complexity_estimate = analysis["time_complexity"]
-    sol.space_complexity_estimate = analysis["space_complexity"]
-    sol.analysis_explanation = analysis["explanation"]
-    sol.analysis_status = analysis["status"]
-    sol.analyzed_code_hash = analysis["code_hash"]
-
-    # Space complexity can update if not manually set, time complexity is left for user
-    if not sol.manual_space_complexity:
-        sol.space_complexity = analysis["space_complexity"]
-
-    db.commit()
-    db.refresh(sol)
-    save_solution_mongo(sol)
-    return sol
 
 @router.delete("/{solution_id}")
-def delete_solution(
-    solution_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    sol = db.query(Solution).join(Question).filter(
-        Solution.id == solution_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not sol:
-        raise HTTPException(status_code=404, detail="Solution not found")
-
-    db.delete(sol)
-    db.commit()
-    delete_solution_mongo(solution_id)
+def delete_solution(solution_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    _owned_solution(db, current_user.id, solution_id)
+    db.solutions.delete_one({"id": solution_id})
     return {"message": "Solution deleted successfully", "id": solution_id}

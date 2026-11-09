@@ -1,144 +1,121 @@
-import json
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from app.database import get_db
-from app.models.question import Question
-from app.models.folder import Folder
-from app.models.bookmark import Bookmark
-from app.models.user import User
+from datetime import date, timedelta
+from typing import Any, Dict, List
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, Query
+from pymongo.database import Database
+
+from app.db import get_db
+from app.routers.auth import CurrentUser, get_current_user
 from app.schemas.progress import (
-    OverallProgressResponse,
+    ActivityDay,
+    ActivityResponse,
     DifficultyBreakdown,
-    FolderProgressItem
+    FolderProgressItem,
+    OverallProgressResponse,
 )
-from app.schemas.question import QuestionListItem
-from app.routers.auth import get_current_user
-from app.services.folder_service import get_folder_path_string, get_all_descendant_folder_ids
+from app.services.folder_service import build_tree_for_user
+from app.services.repo import FolderPaths, bookmarked_ids, to_list_item
+from app.services.tracking import (
+    all_active_dates,
+    daily_activity,
+    end_of_local_day_iso,
+    get_user_tz,
+    local_today,
+    start_of_local_day_iso,
+    streaks,
+)
 
 router = APIRouter(prefix="/progress", tags=["progress"])
 
+
 @router.get("/summary", response_model=OverallProgressResponse)
 def get_progress_summary(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Database = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+    tz: ZoneInfo = Depends(get_user_tz),
 ):
-    all_questions = db.query(Question).filter(Question.user_id == current_user.id).all()
-    bookmarked_ids = {b.question_id for b in db.query(Bookmark).filter(Bookmark.user_id == current_user.id).all()}
+    uid = current_user.id
+    questions: List[Dict[str, Any]] = list(db.questions.find({"user_id": uid}, {"_id": 0, "problem_statement": 0, "notes": 0}))
+    bm = bookmarked_ids(db, uid)
+    paths = FolderPaths.for_user(db, uid)
 
-    total_q = len(all_questions)
-    solved_q = sum(1 for q in all_questions if q.status == "Solved")
-    in_progress_q = sum(1 for q in all_questions if q.status == "In Progress")
-    needs_revision_q = sum(1 for q in all_questions if q.status == "Needs Revision")
-    not_started_q = sum(1 for q in all_questions if q.status == "Not Started")
+    counts = {s: 0 for s in ("Solved", "In Progress", "Needs Revision", "Not Started")}
+    diff = {d: DifficultyBreakdown() for d in ("Easy", "Medium", "Hard")}
+    for q in questions:
+        st = q.get("status") or "Not Started"
+        counts[st if st in counts else "Not Started"] += 1
+        d = q.get("difficulty") if q.get("difficulty") in diff else "Medium"
+        diff[d].total += 1
+        if st == "Solved":
+            diff[d].solved += 1
+    total = len(questions)
 
-    overall_pct = round((solved_q / total_q) * 100, 1) if total_q > 0 else 0.0
+    by_recent = sorted(questions, key=lambda q: str(q.get("updated_at") or ""), reverse=True)
+    recent = [to_list_item(q, bm, paths) for q in by_recent[:6]]
+    continue_q = [q for q in by_recent if q.get("status") in ("In Progress", "Needs Revision")][:4]
+    if len(continue_q) < 4:
+        continue_q += [q for q in by_recent if q.get("status") == "Not Started"][: 4 - len(continue_q)]
+    continue_items = [to_list_item(q, bm, paths) for q in continue_q]
 
-    # Difficulty breakdown
-    diff_map = {
-        "Easy": DifficultyBreakdown(),
-        "Medium": DifficultyBreakdown(),
-        "Hard": DifficultyBreakdown()
-    }
-    for q in all_questions:
-        d = q.difficulty if q.difficulty in diff_map else "Medium"
-        diff_map[d].total += 1
-        if q.status == "Solved":
-            diff_map[d].solved += 1
+    # Overview: top-level topics; if everything lives under a single root, show its children.
+    trees = build_tree_for_user(db, uid)
+    display = trees[0].subfolders if len(trees) == 1 and trees[0].subfolders else trees
+    folder_overview = [
+        FolderProgressItem(folder_id=f.id, folder_name=f.name, total_questions=f.question_count,
+                           solved_questions=f.solved_count, progress_percentage=f.progress_percentage)
+        for f in display
+    ]
+    folder_count = db.folders.count_documents({"user_id": uid})
+    root_count = db.folders.count_documents({"user_id": uid, "parent_id": None})
 
-    # Priority questions matching reference screenshot: Two Sum, Merge Sort, Binary Tree Traversal, Longest Increasing Subsequence
-    priority_titles = ["Two Sum", "Merge Sort", "Binary Tree Traversal", "Longest Increasing Subsequence"]
-    
-    # Recent questions (featured reference items first, then others)
-    all_user_questions = db.query(Question).filter(Question.user_id == current_user.id).all()
-    q_by_title = {q.title: q for q in all_user_questions}
-    
-    featured_q = [q_by_title[t] for t in priority_titles if t in q_by_title]
-    remaining_recent = [q for q in all_user_questions if q.title not in priority_titles]
-    recent_db_q = (featured_q + remaining_recent)[:6]
-
-    def format_item(q: Question) -> QuestionListItem:
-        tags_list = []
-        try:
-            tags_list = json.loads(q.tags) if q.tags else []
-        except Exception:
-            tags_list = [q.tags] if q.tags else []
-
-        return QuestionListItem(
-            id=q.id,
-            folder_id=q.folder_id,
-            title=q.title,
-            difficulty=q.difficulty,
-            status=q.status,
-            tags=tags_list,
-            is_bookmarked=(q.id in bookmarked_ids),
-            folder_path=get_folder_path_string(db, q.folder_id),
-            updated_at=q.updated_at
-        )
-
-    recent_items = [format_item(q) for q in recent_db_q]
-
-    # Continue learning: priority items first, then others
-    continue_q = featured_q if len(featured_q) >= 4 else (featured_q + [q for q in all_user_questions if q.status in ["In Progress", "Needs Revision", "Solved"] and q not in featured_q])[:4]
-    continue_items = [format_item(q) for q in continue_q]
-
-    # Top folders overview
-    root_folders = db.query(Folder).filter(
-        Folder.user_id == current_user.id,
-        Folder.parent_id == None
-    ).order_by(Folder.position).all()
-
-    folder_overview = []
-    # If there are subfolders under root (e.g. Arrays, Sorting under DSA), show those top subfolders
-    display_folders = []
-    dsa_root = next((f for f in root_folders if f.name == "DSA"), None)
-    if dsa_root:
-        display_folders = db.query(Folder).filter(
-            Folder.parent_id == dsa_root.id
-        ).order_by(Folder.position).all()
-    else:
-        display_folders = root_folders
-
-    preferred_order = ["Arrays", "Sorting", "Dynamic Programming"]
-    display_folders = sorted(display_folders, key=lambda f: preferred_order.index(f.name) if f.name in preferred_order else 99)
-
-    for f in display_folders:
-        sub_ids = get_all_descendant_folder_ids(db, f.id)
-        all_ids = sub_ids | {f.id}
-
-        f_questions = db.query(Question).filter(
-            Question.folder_id.in_(all_ids),
-            Question.user_id == current_user.id
-        ).all()
-
-        f_total = len(f_questions)
-        f_solved = sum(1 for q in f_questions if q.status == "Solved")
-        f_pct = round((f_solved / f_total) * 100, 1) if f_total > 0 else 0.0
-
-        folder_overview.append(
-            FolderProgressItem(
-                folder_id=f.id,
-                folder_name=f.name,
-                total_questions=f_total,
-                solved_questions=f_solved,
-                progress_percentage=f_pct
-            )
-        )
-
-    all_user_folders = db.query(Folder).filter(Folder.user_id == current_user.id).all()
-    total_topics = sum(1 for f in all_user_folders if f.parent_id is None)
-    total_subtopics = sum(1 for f in all_user_folders if f.parent_id is not None)
+    today = local_today(tz)
+    current, longest = streaks(all_active_dates(db, uid, tz), today)
+    week_start = start_of_local_day_iso(tz, today - timedelta(days=6))
+    # solved_at is kept when a question leaves Solved, so also require it to still be Solved.
+    solved_this_week = sum(
+        1 for q in questions
+        if q.get("status") == "Solved" and q.get("solved_at") and str(q["solved_at"]) >= week_start
+    )
+    due_cutoff = end_of_local_day_iso(tz)
+    due = sum(1 for q in questions if q.get("next_review_at") and str(q["next_review_at"]) <= due_cutoff)
+    active_days = len(daily_activity(db, uid, tz, 365))
 
     return OverallProgressResponse(
-        total_topics=total_topics,
-        total_subtopics=total_subtopics,
-        total_questions=total_q,
-        solved_questions=solved_q,
-        in_progress_questions=in_progress_q,
-        needs_revision_questions=needs_revision_q,
-        not_started_questions=not_started_q,
-        overall_percentage=overall_pct,
-        difficulty_breakdown=diff_map,
-        recent_questions=recent_items,
+        total_topics=root_count,
+        total_subtopics=folder_count - root_count,
+        total_questions=total,
+        solved_questions=counts["Solved"],
+        in_progress_questions=counts["In Progress"],
+        needs_revision_questions=counts["Needs Revision"],
+        not_started_questions=counts["Not Started"],
+        overall_percentage=round(counts["Solved"] / total * 100, 1) if total else 0.0,
+        difficulty_breakdown=diff,
+        recent_questions=recent,
         continue_learning=continue_items,
-        folder_overview=folder_overview
+        folder_overview=folder_overview,
+        current_streak=current,
+        longest_streak=longest,
+        solved_this_week=solved_this_week,
+        due_reviews=due,
+        total_time_minutes=sum(int(q.get("time_spent_minutes") or 0) for q in questions),
+        active_days=active_days,
     )
+
+
+@router.get("/activity", response_model=ActivityResponse)
+def get_activity(
+    days: int = Query(default=365, ge=7, le=730),
+    db: Database = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+    tz: ZoneInfo = Depends(get_user_tz),
+):
+    buckets = daily_activity(db, current_user.id, tz, days)
+    today = local_today(tz)
+    out = []
+    for i in range(days - 1, -1, -1):
+        d = (today - timedelta(days=i)).isoformat()
+        b = buckets.get(d, {})
+        out.append(ActivityDay(date=d, count=b.get("count", 0), solved=b.get("solved", 0), reviewed=b.get("reviewed", 0)))
+    current, longest = streaks(all_active_dates(db, current_user.id, tz), today)
+    return ActivityResponse(days=out, current_streak=current, longest_streak=longest, total_active_days=len(buckets))

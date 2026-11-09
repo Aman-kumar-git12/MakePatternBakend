@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional
 from datetime import datetime
 
@@ -20,28 +20,28 @@ class SolutionBase(BaseModel):
     position: Optional[int] = 0
 
 class SolutionCreate(BaseModel):
-    title: Optional[str] = "Optimized Approach"
-    solution_type: Optional[str] = "Optimized"
-    language: Optional[str] = "python"
-    code: Optional[str] = ""
-    explanation: Optional[str] = ""
-    time_complexity: Optional[str] = None
-    space_complexity: Optional[str] = None
-    manual_time_complexity: Optional[str] = None
-    manual_space_complexity: Optional[str] = None
-    position: Optional[int] = 0
+    title: Optional[str] = Field(default="Optimized Approach", max_length=200)
+    solution_type: Optional[str] = Field(default="Optimized", max_length=50)
+    language: Optional[str] = Field(default="python", max_length=30)
+    code: Optional[str] = Field(default="", max_length=100_000)
+    explanation: Optional[str] = Field(default="", max_length=100_000)
+    time_complexity: Optional[str] = Field(default=None, max_length=100)
+    space_complexity: Optional[str] = Field(default=None, max_length=100)
+    manual_time_complexity: Optional[str] = Field(default=None, max_length=100)
+    manual_space_complexity: Optional[str] = Field(default=None, max_length=100)
+    position: Optional[int] = Field(default=None, ge=0)
 
 class SolutionUpdate(BaseModel):
-    title: Optional[str] = None
-    solution_type: Optional[str] = None
-    language: Optional[str] = None
-    code: Optional[str] = None
-    explanation: Optional[str] = None
-    time_complexity: Optional[str] = None
-    space_complexity: Optional[str] = None
-    manual_time_complexity: Optional[str] = None
-    manual_space_complexity: Optional[str] = None
-    position: Optional[int] = None
+    title: Optional[str] = Field(default=None, max_length=200)
+    solution_type: Optional[str] = Field(default=None, max_length=50)
+    language: Optional[str] = Field(default=None, max_length=30)
+    code: Optional[str] = Field(default=None, max_length=100_000)
+    explanation: Optional[str] = Field(default=None, max_length=100_000)
+    time_complexity: Optional[str] = Field(default=None, max_length=100)
+    space_complexity: Optional[str] = Field(default=None, max_length=100)
+    manual_time_complexity: Optional[str] = Field(default=None, max_length=100)
+    manual_space_complexity: Optional[str] = Field(default=None, max_length=100)
+    position: Optional[int] = Field(default=None, ge=0)
 
 class SolutionResponse(SolutionBase):
     id: str
@@ -51,8 +51,8 @@ class SolutionResponse(SolutionBase):
     model_config = ConfigDict(from_attributes=True)
 
 class AnalyzeComplexityRequest(BaseModel):
-    code: str
-    language: str = "python"
+    code: str = Field(max_length=100_000)
+    language: str = Field(default="python", max_length=30)
 
 class AnalyzeComplexityResponse(BaseModel):
     time_complexity: str

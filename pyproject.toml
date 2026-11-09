@@ -1,0 +1,13 @@
+[project]
+name = "makepattern-backend"
+version = "1.0.0"
+description = "FastAPI backend for MakePattern (MongoDB)"
+requires-python = ">=3.11"
+# Runtime dependencies are pinned in requirements.txt (dev/test extras in requirements-dev.txt).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+pythonpath = ["."]

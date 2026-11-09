@@ -3,6 +3,8 @@ import hashlib
 import os
 from typing import Dict, Tuple
 
+MAX_ANALYZED_CHARS = 20_000
+
 def compute_code_hash(code: str) -> str:
     """Returns SHA256 hash of normalized code to detect modifications."""
     normalized = "".join(code.split())
@@ -23,6 +25,9 @@ def analyze_complexity(code: str, language: str = "python") -> Dict[str, str]:
     """
     stripped_code = code.strip()
     code_hash = compute_code_hash(stripped_code)
+    # Regex heuristics below are super-linear on huge inputs; analyse a bounded prefix.
+    if len(stripped_code) > MAX_ANALYZED_CHARS:
+        stripped_code = stripped_code[:MAX_ANALYZED_CHARS]
 
     # 1. Handle empty or stub code
     if not stripped_code or len(stripped_code) < 15 or "pass" == stripped_code:

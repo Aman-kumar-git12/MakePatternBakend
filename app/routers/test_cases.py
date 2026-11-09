@@ -1,105 +1,58 @@
+from typing import Any, Dict, List
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from typing import List
-from app.database import get_db
-from app.models.test_case import TestCase
-from app.models.question import Question
-from app.models.user import User
-from app.schemas.test_case import TestCaseCreate, TestCaseUpdate, TestCaseResponse
-from app.routers.auth import get_current_user
-from app.mongodb import save_test_case_mongo, delete_test_case_mongo
+from pymongo.database import Database
+
+from app.db import get_db, now_iso
+from app.routers.auth import CurrentUser, get_current_user
+from app.schemas.test_case import TestCaseCreate, TestCaseResponse, TestCaseUpdate
+from app.services.repo import _sort_children, get_owned_question, new_test_case_doc, next_position, to_test_case
 
 router = APIRouter(prefix="/test-cases", tags=["test_cases"])
 
-@router.get("/question/{question_id}", response_model=List[TestCaseResponse])
-def get_test_cases_for_question(
-    question_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not q:
-        raise HTTPException(status_code=404, detail="Question not found")
+MAX_TEST_CASES_PER_QUESTION = 100
 
-    return db.query(TestCase).filter(
-        TestCase.question_id == question_id
-    ).order_by(TestCase.position, TestCase.created_at).all()
+
+def _owned_test_case(db: Database, user_id: str, test_case_id: str) -> Dict[str, Any]:
+    tc = db.test_cases.find_one({"id": test_case_id}, {"_id": 0})
+    if not tc or not get_owned_question(db, user_id, tc.get("question_id", "")):
+        raise HTTPException(status_code=404, detail="Test case not found")
+    return tc
+
+
+@router.get("/question/{question_id}", response_model=List[TestCaseResponse])
+def get_test_cases_for_question(question_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    if not get_owned_question(db, current_user.id, question_id):
+        raise HTTPException(status_code=404, detail="Question not found")
+    return [to_test_case(t) for t in _sort_children(list(db.test_cases.find({"question_id": question_id}, {"_id": 0})))]
+
 
 @router.post("/question/{question_id}", response_model=TestCaseResponse, status_code=status.HTTP_201_CREATED)
-def create_test_case(
-    question_id: str,
-    tc_in: TestCaseCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not q:
+def create_test_case(question_id: str, tc_in: TestCaseCreate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    if not get_owned_question(db, current_user.id, question_id):
         raise HTTPException(status_code=404, detail="Question not found")
+    if db.test_cases.count_documents({"question_id": question_id}) >= MAX_TEST_CASES_PER_QUESTION:
+        raise HTTPException(status_code=400, detail=f"A question can have at most {MAX_TEST_CASES_PER_QUESTION} test cases.")
+    position = tc_in.position if tc_in.position is not None else next_position(db, "test_cases", {"question_id": question_id})
+    doc = new_test_case_doc(question_id, current_user.id, tc_in.title or "Test Case", tc_in.input or "", tc_in.expected_output or "", tc_in.notes or "", position)
+    db.test_cases.insert_one(doc)
+    doc.pop("_id", None)
+    return to_test_case(doc)
 
-    tc = TestCase(
-        question_id=question_id,
-        title=tc_in.title or "Test Case",
-        input=tc_in.input or "",
-        expected_output=tc_in.expected_output or "",
-        notes=tc_in.notes or "",
-        position=tc_in.position or 0
-    )
-    db.add(tc)
-    db.commit()
-    db.refresh(tc)
-    save_test_case_mongo(tc)
-    return tc
 
 @router.put("/{test_case_id}", response_model=TestCaseResponse)
-def update_test_case(
-    test_case_id: str,
-    tc_in: TestCaseUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    tc = db.query(TestCase).join(Question).filter(
-        TestCase.id == test_case_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not tc:
-        raise HTTPException(status_code=404, detail="Test case not found")
+def update_test_case(test_case_id: str, tc_in: TestCaseUpdate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    tc = _owned_test_case(db, current_user.id, test_case_id)
+    u = {k: v for k, v in tc_in.model_dump(exclude_unset=True).items() if v is not None}
+    if u:
+        u["updated_at"] = now_iso()
+        db.test_cases.update_one({"id": test_case_id}, {"$set": u})
+        tc.update(u)
+    return to_test_case(tc)
 
-    if tc_in.title is not None:
-        tc.title = tc_in.title
-    if tc_in.input is not None:
-        tc.input = tc_in.input
-    if tc_in.expected_output is not None:
-        tc.expected_output = tc_in.expected_output
-    if tc_in.notes is not None:
-        tc.notes = tc_in.notes
-    if tc_in.position is not None:
-        tc.position = tc_in.position
-
-    db.commit()
-    db.refresh(tc)
-    save_test_case_mongo(tc)
-    return tc
 
 @router.delete("/{test_case_id}")
-def delete_test_case(
-    test_case_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    tc = db.query(TestCase).join(Question).filter(
-        TestCase.id == test_case_id,
-        Question.user_id == current_user.id
-    ).first()
-    if not tc:
-        raise HTTPException(status_code=404, detail="Test case not found")
-
-    db.delete(tc)
-    db.commit()
-    delete_test_case_mongo(test_case_id)
+def delete_test_case(test_case_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    _owned_test_case(db, current_user.id, test_case_id)
+    db.test_cases.delete_one({"id": test_case_id})
     return {"message": "Test case deleted successfully", "id": test_case_id}

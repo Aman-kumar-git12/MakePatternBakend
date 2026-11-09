@@ -27,3 +27,23 @@ class OverallProgressResponse(BaseModel):
     continue_learning: List[QuestionListItem]
     folder_overview: List[FolderProgressItem]
 
+    current_streak: int = 0
+    longest_streak: int = 0
+    solved_this_week: int = 0
+    due_reviews: int = 0
+    total_time_minutes: int = 0
+    active_days: int = 0
+
+
+class ActivityDay(BaseModel):
+    date: str
+    count: int = 0
+    solved: int = 0
+    reviewed: int = 0
+
+
+class ActivityResponse(BaseModel):
+    days: List[ActivityDay]
+    current_streak: int = 0
+    longest_streak: int = 0
+    total_active_days: int = 0

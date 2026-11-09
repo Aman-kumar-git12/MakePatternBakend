@@ -1,268 +1,105 @@
-import json
-from sqlalchemy.orm import Session
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set
+
 from fastapi import HTTPException
-from app.models.folder import Folder
-from app.models.question import Question
-from app.models.bookmark import Bookmark
+from pymongo.database import Database
+
+from app.db import parse_tags, ts
 from app.schemas.folder import FolderTreeResponse
 from app.schemas.question import QuestionListItem
-from typing import List, Optional, Set, Dict
+from app.services.repo import bookmarked_ids, descendant_folder_ids, to_list_item
 
-def get_folder_path_string(db: Session, folder_id: str) -> str:
-    path_names = []
-    curr_id: Optional[str] = folder_id
 
-    visited = set()
-    while curr_id and curr_id not in visited:
-        visited.add(curr_id)
-        folder = db.query(Folder).filter(Folder.id == curr_id).first()
-        if not folder:
-            break
-        path_names.append(folder.name)
-        curr_id = folder.parent_id
+def _sort_key(d: Dict[str, Any]):
+    return (int(d.get("position") or 0), str(d.get("created_at") or ""))
 
-    path_names.reverse()
-    return " / ".join(path_names) if path_names else ""
 
-def get_all_descendant_folder_ids(db: Session, folder_id: str) -> Set[str]:
-    descendants = set()
-    queue = [folder_id]
-
-    while queue:
-        current_id = queue.pop(0)
-        subfolders = db.query(Folder).filter(Folder.parent_id == current_id).all()
-        for sf in subfolders:
-            if sf.id not in descendants:
-                descendants.add(sf.id)
-                queue.append(sf.id)
-
-    return descendants
-
-def validate_folder_move(db: Session, folder_id: str, target_parent_id: Optional[str]):
-    if target_parent_id is None:
-        return  # Moving to root is always valid
-
+def validate_folder_move(folders: List[Dict[str, Any]], folder_id: str, target_parent_id: Optional[str]) -> None:
+    if not target_parent_id:
+        return
     if folder_id == target_parent_id:
         raise HTTPException(status_code=400, detail="Cannot move a folder into itself.")
+    if target_parent_id in descendant_folder_ids(folders, folder_id):
+        raise HTTPException(status_code=400, detail="Cannot move a folder into one of its subfolders (circular hierarchy).")
 
-    descendants = get_all_descendant_folder_ids(db, folder_id)
-    if target_parent_id in descendants:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot move a folder into one of its subfolders (circular hierarchy)."
-        )
 
-def build_tree_for_user(db: Session, user_id: str) -> List[FolderTreeResponse]:
-    all_folders = db.query(Folder).filter(Folder.user_id == user_id).order_by(Folder.position, Folder.created_at).all()
-    all_questions = db.query(Question).filter(Question.user_id == user_id).order_by(Question.position, Question.created_at).all()
-    bookmarked_qids = {b.question_id for b in db.query(Bookmark).filter(Bookmark.user_id == user_id).all()}
+def _build(
+    folders: List[Dict[str, Any]],
+    questions: List[Dict[str, Any]],
+    bookmarked: Set[str],
+    root_ids: Optional[List[str]] = None,
+) -> List[FolderTreeResponse]:
+    by_folder: Dict[Optional[str], List[QuestionListItem]] = defaultdict(list)
+    for q in sorted(questions, key=_sort_key):
+        by_folder[q.get("folder_id")].append(to_list_item(q, bookmarked, None))
 
-    # Group questions by folder_id
-    folder_questions: Dict[str, List[QuestionListItem]] = {}
-    for q in all_questions:
-        tags_list = []
-        try:
-            tags_list = json.loads(q.tags) if q.tags else []
-        except Exception:
-            tags_list = [q.tags] if q.tags else []
+    folder_ids = {f["id"] for f in folders}
+    children: Dict[Optional[str], List[Dict[str, Any]]] = defaultdict(list)
+    for f in sorted(folders, key=_sort_key):
+        parent = f.get("parent_id") if f.get("parent_id") in folder_ids else None
+        children[parent].append(f)
 
-        item = QuestionListItem(
-            id=q.id,
-            folder_id=q.folder_id,
-            title=q.title,
-            problem_url=q.problem_url or "",
-            difficulty=q.difficulty,
-            status=q.status,
-            tags=tags_list,
-            is_bookmarked=(q.id in bookmarked_qids),
-            folder_path="",
-            position=q.position or 0,
-            created_at=q.created_at,
-            updated_at=q.updated_at
-        )
-        folder_questions.setdefault(q.folder_id, []).append(item)
-
-    # Build folder lookup
-    folder_map: Dict[str, dict] = {}
-    for f in all_folders:
-        f_tags = []
-        try:
-            f_tags = json.loads(f.tags) if f.tags else []
-        except Exception:
-            f_tags = [f.tags] if f.tags else []
-
-        folder_map[f.id] = {
-            "id": f.id,
-            "user_id": f.user_id,
-            "parent_id": f.parent_id,
-            "name": f.name,
-            "description": f.description or "",
-            "tags": f_tags,
-            "position": f.position,
-            "created_at": f.created_at,
-            "updated_at": f.updated_at,
-            "questions": folder_questions.get(f.id, []),
-            "subfolders": [],
-            "direct_q_count": len(folder_questions.get(f.id, [])),
-            "direct_solved_count": sum(1 for q in folder_questions.get(f.id, []) if q.status == "Solved"),
-            "total_q_count": 0,
-            "total_solved_count": 0,
-        }
-
-    # Connect subfolders
-    root_folder_ids = []
-    for f in all_folders:
-        if f.parent_id and f.parent_id in folder_map:
-            folder_map[f.parent_id]["subfolders"].append(folder_map[f.id])
-        else:
-            root_folder_ids.append(f.id)
-
-    # Post-order traversal to calculate recursive counts
-    def aggregate_counts(node_dict: dict) -> (int, int):
-        total_q = node_dict["direct_q_count"]
-        total_s = node_dict["direct_solved_count"]
-
-        for child in node_dict["subfolders"]:
-            cq, cs = aggregate_counts(child)
-            total_q += cq
-            total_s += cs
-
-        node_dict["total_q_count"] = total_q
-        node_dict["total_solved_count"] = total_s
-        node_dict["progress_percentage"] = (
-            round((total_s / total_q) * 100, 1) if total_q > 0 else 0.0
-        )
-        return total_q, total_s
-
-    for r_id in root_folder_ids:
-        aggregate_counts(folder_map[r_id])
-
-    # Convert to schema response
-    def to_schema(node_dict: dict) -> FolderTreeResponse:
+    def node(f: Dict[str, Any], seen: Set[str]) -> FolderTreeResponse:
+        seen = seen | {f["id"]}
+        subs = [node(c, seen) for c in children.get(f["id"], []) if c["id"] not in seen]
+        qs = by_folder.get(f["id"], [])
+        total = len(qs) + sum(s.question_count for s in subs)
+        solved = sum(1 for q in qs if q.status == "Solved") + sum(s.solved_count for s in subs)
         return FolderTreeResponse(
-            id=node_dict["id"],
-            user_id=node_dict["user_id"],
-            parent_id=node_dict["parent_id"],
-            name=node_dict["name"],
-            description=node_dict.get("description", ""),
-            tags=node_dict.get("tags", []),
-            position=node_dict["position"],
-            created_at=node_dict["created_at"],
-            updated_at=node_dict["updated_at"],
-            question_count=node_dict["total_q_count"],
-            solved_count=node_dict["total_solved_count"],
-            progress_percentage=node_dict["progress_percentage"],
-            questions=node_dict["questions"],
-            subfolders=[to_schema(sf) for sf in node_dict["subfolders"]]
+            id=f["id"],
+            user_id=f.get("user_id") or "",
+            parent_id=f.get("parent_id"),
+            name=f.get("name") or "Untitled",
+            description=f.get("description") or "",
+            tags=parse_tags(f.get("tags")),
+            position=int(f.get("position") or 0),
+            created_at=ts(f, "created_at"),
+            updated_at=ts(f, "updated_at"),
+            question_count=total,
+            solved_count=solved,
+            progress_percentage=round(solved / total * 100, 1) if total else 0.0,
+            questions=qs,
+            subfolders=subs,
         )
 
-    return [to_schema(folder_map[r_id]) for r_id in root_folder_ids]
+    if root_ids is None:
+        roots = children.get(None, [])
+    else:
+        roots = [f for f in folders if f["id"] in root_ids]
+    return [node(f, set()) for f in roots]
 
-def build_tree_for_folder(db: Session, folder_id: str) -> Optional[FolderTreeResponse]:
-    root_folder = db.query(Folder).filter(Folder.id == folder_id).first()
-    if not root_folder:
+
+def build_tree_for_user(db: Database, user_id: str) -> List[FolderTreeResponse]:
+    folders = list(db.folders.find({"user_id": user_id}, {"_id": 0}))
+    questions = list(db.questions.find({"user_id": user_id}, {"_id": 0, "problem_statement": 0, "notes": 0}))
+    return _build(folders, questions, bookmarked_ids(db, user_id))
+
+
+def build_tree_for_folder(db: Database, user_id: str, folder_id: str) -> Optional[FolderTreeResponse]:
+    folders = list(db.folders.find({"user_id": user_id}, {"_id": 0}))
+    if not any(f["id"] == folder_id for f in folders):
         return None
+    ids = descendant_folder_ids(folders, folder_id) | {folder_id}
+    scoped = [f for f in folders if f["id"] in ids]
+    questions = list(db.questions.find({"user_id": user_id, "folder_id": {"$in": list(ids)}}, {"_id": 0, "problem_statement": 0, "notes": 0}))
+    tree = _build(scoped, questions, set(), root_ids=[folder_id])
+    return tree[0] if tree else None
 
-    descendant_ids = get_all_descendant_folder_ids(db, folder_id)
-    all_folder_ids = {folder_id} | descendant_ids
 
-    all_folders = db.query(Folder).filter(
-        Folder.id.in_(all_folder_ids)
-    ).order_by(Folder.position.asc(), Folder.created_at.asc()).all()
-
-    all_questions = db.query(Question).filter(
-        Question.folder_id.in_(all_folder_ids)
-    ).order_by(Question.position.asc(), Question.created_at.asc()).all()
-
-    folder_questions: Dict[str, List[QuestionListItem]] = {}
-    for q in all_questions:
-        tags_list = []
-        try:
-            tags_list = json.loads(q.tags) if q.tags else []
-        except Exception:
-            tags_list = [q.tags] if q.tags else []
-
-        item = QuestionListItem(
-            id=q.id,
-            folder_id=q.folder_id,
-            title=q.title,
-            problem_url=q.problem_url or "",
-            difficulty=q.difficulty,
-            status=q.status,
-            tags=tags_list,
-            is_bookmarked=False,
-            folder_path="",
-            position=q.position or 0,
-            created_at=q.created_at,
-            updated_at=q.updated_at
-        )
-        folder_questions.setdefault(q.folder_id, []).append(item)
-
-    folder_map: Dict[str, dict] = {}
-    for f in all_folders:
-        f_tags = []
-        try:
-            f_tags = json.loads(f.tags) if f.tags else []
-        except Exception:
-            f_tags = [f.tags] if f.tags else []
-
-        folder_map[f.id] = {
-            "id": f.id,
-            "user_id": f.user_id,
-            "parent_id": f.parent_id,
-            "name": f.name,
-            "description": f.description or "",
-            "tags": f_tags,
-            "position": f.position,
-            "created_at": f.created_at,
-            "updated_at": f.updated_at,
-            "questions": folder_questions.get(f.id, []),
-            "subfolders": [],
-            "direct_q_count": len(folder_questions.get(f.id, [])),
-            "direct_solved_count": sum(1 for q in folder_questions.get(f.id, []) if q.status == "Solved"),
-            "total_q_count": 0,
-            "total_solved_count": 0,
-        }
-
-    for f in all_folders:
-        if f.id != folder_id and f.parent_id and f.parent_id in folder_map:
-            folder_map[f.parent_id]["subfolders"].append(folder_map[f.id])
-
-    def aggregate_counts(node_dict: dict) -> (int, int):
-        total_q = node_dict["direct_q_count"]
-        total_s = node_dict["direct_solved_count"]
-
-        for child in node_dict["subfolders"]:
-            cq, cs = aggregate_counts(child)
-            total_q += cq
-            total_s += cs
-
-        node_dict["total_q_count"] = total_q
-        node_dict["total_solved_count"] = total_s
-        node_dict["progress_percentage"] = (
-            round((total_s / total_q) * 100, 1) if total_q > 0 else 0.0
-        )
-        return total_q, total_s
-
-    aggregate_counts(folder_map[folder_id])
-
-    def to_schema(node_dict: dict) -> FolderTreeResponse:
-        return FolderTreeResponse(
-            id=node_dict["id"],
-            user_id=node_dict["user_id"],
-            parent_id=node_dict["parent_id"],
-            name=node_dict["name"],
-            description=node_dict.get("description", ""),
-            tags=node_dict.get("tags", []),
-            position=node_dict["position"],
-            created_at=node_dict["created_at"],
-            updated_at=node_dict["updated_at"],
-            question_count=node_dict["total_q_count"],
-            solved_count=node_dict["total_solved_count"],
-            progress_percentage=node_dict["progress_percentage"],
-            questions=node_dict["questions"],
-            subfolders=[to_schema(sf) for sf in node_dict["subfolders"]]
-        )
-
-    return to_schema(folder_map[folder_id])
-
+def folder_summary(f: Dict[str, Any], question_count: int = 0, solved: int = 0) -> FolderTreeResponse:
+    return FolderTreeResponse(
+        id=f["id"],
+        user_id=f.get("user_id") or "",
+        parent_id=f.get("parent_id"),
+        name=f.get("name") or "Untitled",
+        description=f.get("description") or "",
+        tags=parse_tags(f.get("tags")),
+        position=int(f.get("position") or 0),
+        created_at=ts(f, "created_at"),
+        updated_at=ts(f, "updated_at"),
+        question_count=question_count,
+        solved_count=solved,
+        progress_percentage=round(solved / question_count * 100, 1) if question_count else 0.0,
+        questions=[],
+        subfolders=[],
+    )

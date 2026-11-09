@@ -1,361 +1,192 @@
-import json
+from typing import Any, Dict, List
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from typing import List
-from sqlalchemy import func
-from app.database import get_db
-from app.models.folder import Folder
-from app.models.user import User
+from pymongo.database import Database
+
+from app.db import bulk_update, get_db, now_iso
+from app.routers.auth import CurrentUser, get_current_user
 from app.schemas.folder import (
-    FolderCreate, FolderUpdate, FolderMove, FolderTreeResponse, ReorderItem,
-    ShareResponse, ShareStatusUpdate
+    FolderCreate,
+    FolderMove,
+    FolderTreeResponse,
+    FolderUpdate,
+    ReorderItem,
+    ShareResponse,
+    ShareStatusUpdate,
 )
-from app.mongodb import (
-    get_share_for_folder_mongo, create_or_get_share_mongo,
-    update_share_status_mongo, revoke_share_mongo,
-    save_folder_mongo, bulk_save_folders_mongo, delete_folder_mongo,
-    update_share_snapshot_status_mongo, revoke_share_snapshot_mongo
-)
-from app.services.share_service import capture_and_save_share_snapshot
-from app.routers.auth import get_current_user
-from app.services.folder_service import (
-    build_tree_for_user,
-    validate_folder_move,
-    get_all_descendant_folder_ids
-)
+from app.services import share_service
+from app.services.folder_service import build_tree_for_folder, build_tree_for_user, folder_summary, validate_folder_move
+from app.services.repo import get_owned_folder, new_folder_doc, next_position
+from app.services.trash import trash_folder
 
 router = APIRouter(prefix="/folders", tags=["folders"])
 
+
+def _all_folders(db: Database, user_id: str) -> List[Dict[str, Any]]:
+    return list(db.folders.find({"user_id": user_id}, {"_id": 0, "id": 1, "parent_id": 1}))
+
+
 @router.get("/tree", response_model=List[FolderTreeResponse])
-def get_folder_tree(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    tree = build_tree_for_user(db, current_user.id)
-    if not tree:
-        from app.mongodb import restore_user_data_from_mongo_to_sqlite
-        restore_user_data_from_mongo_to_sqlite(db, current_user.id)
-        tree = build_tree_for_user(db, current_user.id)
-    return tree
+def get_folder_tree(db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    return build_tree_for_user(db, current_user.id)
+
 
 @router.post("/", response_model=FolderTreeResponse, status_code=status.HTTP_201_CREATED)
-def create_folder(
-    folder_in: FolderCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    if folder_in.parent_id:
-        parent = db.query(Folder).filter(
-            Folder.id == folder_in.parent_id,
-            Folder.user_id == current_user.id
-        ).first()
-        if not parent:
-            raise HTTPException(status_code=404, detail="Parent folder not found")
-
-    tags_json = json.dumps(folder_in.tags) if folder_in.tags else "[]"
-
-    if folder_in.position is not None and folder_in.position > 0:
-        folder_pos = folder_in.position
-    else:
-        max_pos = db.query(func.max(Folder.position)).filter(
-            Folder.user_id == current_user.id,
-            Folder.parent_id == folder_in.parent_id
-        ).scalar()
-        folder_pos = (max_pos + 1) if max_pos is not None else 0
-
-    folder = Folder(
-        user_id=current_user.id,
-        parent_id=folder_in.parent_id,
-        name=folder_in.name.strip(),
+def create_folder(folder_in: FolderCreate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    parent_id = folder_in.parent_id or None
+    if parent_id and not get_owned_folder(db, current_user.id, parent_id):
+        raise HTTPException(status_code=404, detail="Parent folder not found")
+    position = folder_in.position if folder_in.position is not None else next_position(
+        db, "folders", {"user_id": current_user.id, "parent_id": parent_id}
+    )
+    doc = new_folder_doc(
+        current_user.id,
+        folder_in.name.strip(),
+        parent_id,
+        position,
         description=folder_in.description or "",
-        tags=tags_json,
-        position=folder_pos
+        tags=[t.strip()[:50] for t in (folder_in.tags or []) if t and t.strip()],
     )
-    db.add(folder)
-    db.commit()
-    db.refresh(folder)
-    save_folder_mongo(folder)
+    db.folders.insert_one(doc)
+    return folder_summary(doc)
 
-    parsed_tags = []
-    try:
-        parsed_tags = json.loads(folder.tags) if folder.tags else []
-    except Exception:
-        parsed_tags = [folder.tags] if folder.tags else []
-
-    return FolderTreeResponse(
-        id=folder.id,
-        user_id=folder.user_id,
-        parent_id=folder.parent_id,
-        name=folder.name,
-        description=folder.description or "",
-        tags=parsed_tags,
-        position=folder.position,
-        created_at=folder.created_at,
-        updated_at=folder.updated_at,
-        question_count=0,
-        solved_count=0,
-        progress_percentage=0.0,
-        subfolders=[],
-        questions=[]
-    )
 
 @router.post("/reorder")
-def reorder_folders(
-    items: List[ReorderItem],
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    for item in items:
-        db.query(Folder).filter(
-            Folder.id == item.id,
-            Folder.user_id == current_user.id
-        ).update({"position": item.position})
-    db.commit()
-    reordered_folders = db.query(Folder).filter(Folder.id.in_([it.id for it in items])).all()
-    bulk_save_folders_mongo(reordered_folders)
+def reorder_folders(items: List[ReorderItem], db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    now = now_iso()
+    # One round trip instead of up to 2000 sequential updates.
+    ops = [
+        ({"id": item.id, "user_id": current_user.id}, {"$set": {"position": item.position, "updated_at": now}})
+        for item in items[:2000]
+    ]
+    if ops:
+        bulk_update(db.folders, ops)
     return {"message": "Folders reordered successfully"}
 
+
 @router.put("/{folder_id}", response_model=FolderTreeResponse)
-def update_folder(
-    folder_id: str,
-    folder_in: FolderUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    folder = db.query(Folder).filter(
-        Folder.id == folder_id,
-        Folder.user_id == current_user.id
-    ).first()
+def update_folder(folder_id: str, folder_in: FolderUpdate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    folder = get_owned_folder(db, current_user.id, folder_id)
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")
 
+    updates: Dict[str, Any] = {}
     if folder_in.name is not None:
-        folder.name = folder_in.name.strip()
+        updates["name"] = folder_in.name.strip()
     if folder_in.description is not None:
-        folder.description = folder_in.description
+        updates["description"] = folder_in.description
     if folder_in.tags is not None:
-        folder.tags = json.dumps(folder_in.tags)
+        updates["tags"] = [t.strip()[:50] for t in folder_in.tags if t and t.strip()]
     if folder_in.parent_id is not None:
-        target_id = folder_in.parent_id if folder_in.parent_id != "" else None
-        if target_id is not None:
-            if target_id == folder.id:
-                raise HTTPException(status_code=400, detail="Cannot move a folder into itself.")
-            parent = db.query(Folder).filter(
-                Folder.id == target_id,
-                Folder.user_id == current_user.id
-            ).first()
-            if not parent:
-                raise HTTPException(status_code=404, detail="Target parent folder not found")
-        validate_folder_move(db, folder.id, target_id)
-        folder.parent_id = target_id
+        target = folder_in.parent_id or None
+        if target and not get_owned_folder(db, current_user.id, target):
+            raise HTTPException(status_code=404, detail="Target parent folder not found")
+        validate_folder_move(_all_folders(db, current_user.id), folder_id, target)
+        updates["parent_id"] = target
     if folder_in.position is not None:
-        folder.position = folder_in.position
+        updates["position"] = folder_in.position
+    if updates:
+        updates["updated_at"] = now_iso()
+        db.folders.update_one({"id": folder_id, "user_id": current_user.id}, {"$set": updates})
+        folder.update(updates)
 
-    db.commit()
-    db.refresh(folder)
-    save_folder_mongo(folder)
+    # Same recursive counts as /folders/tree, so progress doesn't change after a rename.
+    tree = build_tree_for_folder(db, current_user.id, folder_id)
+    if tree is not None:
+        return tree
+    direct = list(db.questions.find({"user_id": current_user.id, "folder_id": folder_id}, {"_id": 0, "status": 1}))
+    return folder_summary(folder, len(direct), sum(1 for q in direct if q.get("status") == "Solved"))
 
-    parsed_tags = []
-    try:
-        parsed_tags = json.loads(folder.tags) if folder.tags else []
-    except Exception:
-        parsed_tags = [folder.tags] if folder.tags else []
-
-    # Return refreshed tree item
-    return FolderTreeResponse(
-        id=folder.id,
-        user_id=folder.user_id,
-        parent_id=folder.parent_id,
-        name=folder.name,
-        description=folder.description or "",
-        tags=parsed_tags,
-        position=folder.position,
-        created_at=folder.created_at,
-        updated_at=folder.updated_at,
-        question_count=len(folder.questions),
-        solved_count=sum(1 for q in folder.questions if q.status == "Solved"),
-        progress_percentage=0.0,
-        subfolders=[],
-        questions=[]
-    )
 
 @router.post("/{folder_id}/move")
-def move_folder(
-    folder_id: str,
-    move_in: FolderMove,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    folder = db.query(Folder).filter(
-        Folder.id == folder_id,
-        Folder.user_id == current_user.id
-    ).first()
-    if not folder:
+def move_folder(folder_id: str, move_in: FolderMove, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    if not get_owned_folder(db, current_user.id, folder_id):
         raise HTTPException(status_code=404, detail="Folder not found")
+    target = move_in.target_parent_id or None
+    if target and not get_owned_folder(db, current_user.id, target):
+        raise HTTPException(status_code=404, detail="Target parent folder not found")
+    validate_folder_move(_all_folders(db, current_user.id), folder_id, target)
+    updates: Dict[str, Any] = {"parent_id": target, "updated_at": now_iso()}
+    updates["position"] = move_in.new_position if move_in.new_position is not None else next_position(
+        db, "folders", {"user_id": current_user.id, "parent_id": target}
+    )
+    db.folders.update_one({"id": folder_id, "user_id": current_user.id}, {"$set": updates})
+    return {"message": "Folder moved successfully", "folder_id": folder_id, "parent_id": target}
 
-    # Validate target parent and prevent circular hierarchy
-    if move_in.target_parent_id:
-        target_parent = db.query(Folder).filter(
-            Folder.id == move_in.target_parent_id,
-            Folder.user_id == current_user.id
-        ).first()
-        if not target_parent:
-            raise HTTPException(status_code=404, detail="Target parent folder not found")
-
-    validate_folder_move(db, folder_id, move_in.target_parent_id)
-
-    folder.parent_id = move_in.target_parent_id
-    if move_in.new_position is not None:
-        folder.position = move_in.new_position
-
-    db.commit()
-    db.refresh(folder)
-    save_folder_mongo(folder)
-    return {"message": "Folder moved successfully", "folder_id": folder.id, "parent_id": folder.parent_id}
 
 @router.delete("/{folder_id}")
-def delete_folder(
-    folder_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    folder = db.query(Folder).filter(
-        Folder.id == folder_id,
-        Folder.user_id == current_user.id
-    ).first()
-    if not folder:
+def delete_folder(folder_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    if not get_owned_folder(db, current_user.id, folder_id):
         raise HTTPException(status_code=404, detail="Folder not found")
+    trash_id, deleted = trash_folder(db, current_user.id, folder_id)
+    for fid in deleted:
+        share_service.disable_share(db, current_user.id, fid)
+    return {"message": "Folder moved to trash", "deleted_folder_ids": sorted(deleted), "trash_id": trash_id}
 
-    descendant_ids = get_all_descendant_folder_ids(db, folder_id)
-    all_target_ids = descendant_ids | {folder_id}
 
-    # Delete folder (SQLAlchemy cascading will delete descendant folders & questions)
-    db.delete(folder)
-    db.commit()
-    delete_folder_mongo(folder_id, list(descendant_ids))
+# ---------------------------------------------------------------------------
+# Sharing (owner side)
+# ---------------------------------------------------------------------------
 
-    return {"message": "Folder and contents deleted successfully", "deleted_folder_ids": list(all_target_ids)}
-
-# =========================================================================
-# Pattern Sharing Endpoints (Ownership Checked & Persisted in MongoDB)
-# =========================================================================
-
-def _resolve_folder_name(folder_id: str, db: Session, current_user: User) -> str:
+def _folder_name(db: Database, user: CurrentUser, folder_id: str) -> str:
     if folder_id == "all":
         return "All Patterns"
-    folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == current_user.id).first()
+    folder = get_owned_folder(db, user.id, folder_id)
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found or unauthorized")
-    return folder.name
+    return folder.get("name") or "Pattern"
+
+
+def _share_response(share: Dict[str, Any], folder_name: str) -> ShareResponse:
+    return ShareResponse(
+        share_id=share["share_id"],
+        folder_id=share["folder_id"],
+        folder_name=share.get("folder_name") or folder_name,
+        is_active=bool(share.get("is_active")),
+        share_url=f"/shared/{share['share_id']}",
+        created_at=share.get("created_at", ""),
+        updated_at=share.get("updated_at", ""),
+    )
+
 
 @router.get("/{folder_id}/share", response_model=ShareResponse)
-def get_folder_share_settings(
-    folder_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    folder_name = _resolve_folder_name(folder_id, db, current_user)
-    share = get_share_for_folder_mongo(current_user.id, folder_id)
+def get_folder_share_settings(folder_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    name = _folder_name(db, current_user, folder_id)
+    share = share_service.get_share(db, current_user.id, folder_id)
     if not share:
         raise HTTPException(status_code=404, detail="No share configuration found for this folder")
+    return _share_response(share, name)
 
-    return ShareResponse(
-        share_id=share["share_id"],
-        folder_id=share["folder_id"],
-        folder_name=share.get("folder_name") or folder_name,
-        is_active=share.get("is_active", False),
-        share_url=f"/shared/{share['share_id']}",
-        created_at=share.get("created_at", ""),
-        updated_at=share.get("updated_at", "")
-    )
 
 @router.post("/{folder_id}/share", response_model=ShareResponse)
-def enable_or_create_folder_share(
-    folder_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    folder_name = _resolve_folder_name(folder_id, db, current_user)
-    share = create_or_get_share_mongo(
-        user_id=current_user.id,
-        folder_id=folder_id,
-        folder_name=folder_name,
-        email=current_user.email,
-        full_name=current_user.full_name or "",
-        hashed_password=current_user.hashed_password or ""
-    )
+def enable_or_create_folder_share(folder_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    name = _folder_name(db, current_user, folder_id)
+    share = share_service.create_or_enable_share(db, current_user, folder_id, name)
+    return _share_response(share, name)
 
-    # Capture and freeze an immutable snapshot of this pattern hierarchy, questions & solutions (never overwrites if already existing)
-    capture_and_save_share_snapshot(db, current_user, folder_id, folder_name, share["share_id"], force_overwrite=False)
-
-    return ShareResponse(
-        share_id=share["share_id"],
-        folder_id=share["folder_id"],
-        folder_name=share.get("folder_name") or folder_name,
-        is_active=share.get("is_active", True),
-        share_url=f"/shared/{share['share_id']}",
-        created_at=share.get("created_at", ""),
-        updated_at=share.get("updated_at", "")
-    )
 
 @router.patch("/{folder_id}/share", response_model=ShareResponse)
 @router.put("/{folder_id}/share", response_model=ShareResponse)
-def toggle_folder_share_status(
-    folder_id: str,
-    update_data: ShareStatusUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    folder_name = _resolve_folder_name(folder_id, db, current_user)
-    share = update_share_status_mongo(current_user.id, folder_id, update_data.is_active)
+def toggle_folder_share_status(folder_id: str, update_data: ShareStatusUpdate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    name = _folder_name(db, current_user, folder_id)
+    if update_data.is_active:
+        share = share_service.create_or_enable_share(db, current_user, folder_id, name)
+    else:
+        share = share_service.disable_share(db, current_user.id, folder_id)
     if not share:
         raise HTTPException(status_code=404, detail="Share settings not found")
+    return _share_response(share, name)
 
-    update_share_snapshot_status_mongo(current_user.id, folder_id, update_data.is_active)
-
-    return ShareResponse(
-        share_id=share["share_id"],
-        folder_id=share["folder_id"],
-        folder_name=share.get("folder_name") or folder_name,
-        is_active=share.get("is_active", False),
-        share_url=f"/shared/{share['share_id']}",
-        created_at=share.get("created_at", ""),
-        updated_at=share.get("updated_at", "")
-    )
 
 @router.post("/{folder_id}/share/revoke", response_model=ShareResponse)
-def revoke_and_regenerate_folder_share(
-    folder_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    folder_name = _resolve_folder_name(folder_id, db, current_user)
-    share = revoke_share_mongo(current_user.id, folder_id, regenerate_new=True, folder_name=folder_name)
-    if not share:
-        raise HTTPException(status_code=404, detail="Failed to revoke share link")
+def revoke_and_regenerate_folder_share(folder_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    name = _folder_name(db, current_user, folder_id)
+    share = share_service.regenerate_share(db, current_user, folder_id, name)
+    return _share_response(share, name)
 
-    # Capture a fresh snapshot for the new share link
-    capture_and_save_share_snapshot(db, current_user, folder_id, folder_name, share["share_id"], force_overwrite=True)
-
-    return ShareResponse(
-        share_id=share["share_id"],
-        folder_id=share["folder_id"],
-        folder_name=share.get("folder_name") or folder_name,
-        is_active=share.get("is_active", True),
-        share_url=f"/shared/{share['share_id']}",
-        created_at=share.get("created_at", ""),
-        updated_at=share.get("updated_at", "")
-    )
 
 @router.delete("/{folder_id}/share")
-def disable_folder_share(
-    folder_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    _resolve_folder_name(folder_id, db, current_user)
-    revoke_share_mongo(current_user.id, folder_id, regenerate_new=False)
-    revoke_share_snapshot_mongo(current_user.id, folder_id)
+def disable_folder_share(folder_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    _folder_name(db, current_user, folder_id)
+    share_service.disable_share(db, current_user.id, folder_id)
     return {"message": "Sharing disabled successfully for this pattern"}
-
-

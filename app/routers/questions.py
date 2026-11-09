@@ -1,382 +1,307 @@
-import json
+import re
+from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from typing import List, Optional
-from app.database import get_db
-from app.models.question import Question
-from app.models.folder import Folder
-from app.models.bookmark import Bookmark
-from app.models.user import User
+from pymongo.database import Database
+
+from app.db import bulk_update, get_db, new_id, now_iso, parse_tags
+from app.routers.auth import CurrentUser, get_current_user
+from app.schemas.folder import ReorderItem
 from app.schemas.question import (
+    AttemptLog,
+    BulkAction,
+    BulkActionResponse,
+    Difficulty,
     QuestionCreate,
-    QuestionUpdate,
+    QuestionListItem,
     QuestionMove,
     QuestionResponse,
-    QuestionListItem
+    QuestionUpdate,
+    Status,
 )
-from app.schemas.solution import SolutionResponse
-from app.routers.auth import get_current_user
-from app.services.folder_service import get_folder_path_string
-from app.mongodb import (
-    save_question_mongo,
-    bulk_save_questions_mongo,
-    delete_question_mongo
+from app.services.leetcode_parse import slug_from_url
+from app.services.repo import (
+    FolderPaths,
+    bookmarked_ids,
+    delete_questions_cascade,
+    get_owned_folder,
+    get_owned_question,
+    new_question_doc,
+    next_position,
+    to_list_item,
+    to_response,
 )
+from app.services.tracking import record_activity, status_change_updates
+from app.services.trash import trash_questions
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
-from app.schemas.test_case import TestCaseResponse
+LIST_PROJECTION = {"_id": 0, "problem_statement": 0, "notes": 0}
 
-def format_question_response(db: Session, q: Question, user_id: str) -> QuestionResponse:
-    tags_list = []
-    try:
-        tags_list = json.loads(q.tags) if q.tags else []
-    except Exception:
-        tags_list = [q.tags] if q.tags else []
 
-    is_bookmarked = db.query(Bookmark).filter(
-        Bookmark.user_id == user_id,
-        Bookmark.question_id == q.id
-    ).first() is not None
+def format_question_response(db: Database, q: Dict[str, Any], user_id: str) -> QuestionResponse:
+    return to_response(db, q, user_id)
 
-    folder_path = get_folder_path_string(db, q.folder_id) if q.folder_id else ""
 
-    solutions = [
-        SolutionResponse(
-            id=s.id,
-            question_id=s.question_id,
-            title=s.title,
-            solution_type=getattr(s, 'solution_type', 'Optimized') or 'Optimized',
-            language=s.language,
-            code=s.code,
-            explanation=getattr(s, 'explanation', '') or '',
-            time_complexity_estimate=getattr(s, 'time_complexity_estimate', '') or '',
-            space_complexity_estimate=getattr(s, 'space_complexity_estimate', 'O(1)') or 'O(1)',
-            manual_time_complexity=getattr(s, 'manual_time_complexity', None),
-            manual_space_complexity=getattr(s, 'manual_space_complexity', None),
-            time_complexity=s.time_complexity,
-            space_complexity=s.space_complexity,
-            analysis_explanation=getattr(s, 'analysis_explanation', '') or '',
-            analysis_status=getattr(s, 'analysis_status', 'Completed') or 'Completed',
-            analyzed_code_hash=getattr(s, 'analyzed_code_hash', '') or '',
-            position=s.position,
-            created_at=s.created_at,
-            updated_at=s.updated_at
-        )
-        for s in q.solutions
-    ]
+def _search_filter(term: str) -> Dict[str, Any]:
+    rx = {"$regex": re.escape(term[:200]), "$options": "i"}
+    return {"$or": [{"title": rx}, {"problem_statement": rx}, {"notes": rx}, {"tags": rx}, {"leetcode_id": term.strip()}]}
 
-    test_cases = [
-        TestCaseResponse(
-            id=tc.id,
-            question_id=tc.question_id,
-            title=tc.title,
-            input=tc.input,
-            expected_output=tc.expected_output,
-            notes=tc.notes or '',
-            position=tc.position,
-            created_at=tc.created_at,
-            updated_at=tc.updated_at
-        )
-        for tc in (q.test_cases if hasattr(q, 'test_cases') else [])
-    ]
 
-    return QuestionResponse(
-        id=q.id,
-        user_id=q.user_id,
-        folder_id=q.folder_id,
-        title=q.title,
-        problem_url=getattr(q, 'problem_url', '') or "",
-        problem_statement=q.problem_statement or "",
-        notes=q.notes or "",
-        difficulty=q.difficulty or "Medium",
-        status=q.status or "Not Started",
-        tags=tags_list,
-        position=q.position,
-        is_bookmarked=is_bookmarked,
-        folder_path=folder_path,
-        solutions=solutions,
-        test_cases=test_cases,
-        created_at=q.created_at,
-        updated_at=q.updated_at
-    )
+def _resolve_folder(db: Database, user_id: str, folder_id: Optional[str]) -> Optional[str]:
+    """'' / None -> unfiled; otherwise must be owned."""
+    if not folder_id or not folder_id.strip():
+        return None
+    folder = get_owned_folder(db, user_id, folder_id.strip())
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return folder["id"]
+
+
+def apply_status(db: Database, user_id: str, q: Dict[str, Any], new_status: str, updates: Dict[str, Any]) -> None:
+    status_updates, newly_solved = status_change_updates(q, new_status)
+    updates.update(status_updates)
+    if newly_solved:
+        record_activity(db, user_id, "solved", q["id"])
+
 
 @router.get("/", response_model=List[QuestionListItem])
 def list_questions(
     folder_id: Optional[str] = None,
-    difficulty: Optional[str] = None,
-    status: Optional[str] = None,
-    search: Optional[str] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    difficulty: Optional[Difficulty] = None,
+    status: Optional[Status] = None,
+    search: Optional[str] = Query(default=None, max_length=200),
+    db: Database = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    query = db.query(Question).filter(Question.user_id == current_user.id)
-    if query.count() == 0:
-        from app.mongodb import restore_user_data_from_mongo_to_sqlite
-        restore_user_data_from_mongo_to_sqlite(db, current_user.id)
-        query = db.query(Question).filter(Question.user_id == current_user.id)
-
+    query: Dict[str, Any] = {"user_id": current_user.id}
     if folder_id:
-        query = query.filter(Question.folder_id == folder_id)
+        query["folder_id"] = folder_id
     if difficulty:
-        query = query.filter(Question.difficulty == difficulty)
+        query["difficulty"] = difficulty
     if status:
-        query = query.filter(Question.status == status)
+        query["status"] = status
     if search:
-        search_filter = f"%{search}%"
-        query = query.filter(
-            (Question.title.ilike(search_filter)) |
-            (Question.problem_statement.ilike(search_filter)) |
-            (Question.notes.ilike(search_filter)) |
-            (Question.tags.ilike(search_filter))
-        )
+        query.update(_search_filter(search))
+    docs = list(db.questions.find(query, LIST_PROJECTION).sort([("position", 1), ("created_at", 1)]))
+    paths = FolderPaths.for_user(db, current_user.id)
+    bm = bookmarked_ids(db, current_user.id)
+    return [to_list_item(q, bm, paths) for q in docs]
 
-    questions = query.order_by(Question.position.asc(), Question.created_at.asc()).all()
-    bookmarked_ids = {b.question_id for b in db.query(Bookmark).filter(Bookmark.user_id == current_user.id).all()}
-
-    result = []
-    for q in questions:
-        tags_list = []
-        try:
-            tags_list = json.loads(q.tags) if q.tags else []
-        except Exception:
-            tags_list = [q.tags] if q.tags else []
-
-        result.append(
-            QuestionListItem(
-                id=q.id,
-                folder_id=q.folder_id,
-                title=q.title,
-                problem_url=getattr(q, 'problem_url', '') or "",
-                difficulty=q.difficulty,
-                status=q.status,
-                tags=tags_list,
-                is_bookmarked=(q.id in bookmarked_ids),
-                folder_path=get_folder_path_string(db, q.folder_id) if q.folder_id else "",
-                position=q.position or 0,
-                created_at=q.created_at,
-                updated_at=q.updated_at
-            )
-        )
-    return result
 
 @router.get("/random", response_model=List[QuestionListItem])
 def get_random_questions(
-    count: int = Query(default=3, ge=1, le=5, description="Number of random questions to return (max 5)"),
-    only_revision: bool = Query(default=False, description="Filter only questions flagged for revision"),
-    pool: Optional[str] = Query(default="all", description="Pool to sample from: 'all', 'not_revised', or 'revision'"),
-    status: Optional[str] = Query(default=None, description="Optional status filter"),
-    difficulty: Optional[str] = Query(default=None, description="Optional difficulty filter"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    count: int = Query(default=3, ge=1, le=5),
+    only_revision: bool = Query(default=False),
+    pool: Optional[str] = Query(default="all"),
+    status: Optional[str] = Query(default=None),
+    difficulty: Optional[str] = Query(default=None),
+    db: Database = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    query = db.query(Question).filter(Question.user_id == current_user.id)
+    query: Dict[str, Any] = {"user_id": current_user.id}
     if pool == "revision" or only_revision or status == "Needs Revision":
-        query = query.filter(Question.status == "Needs Revision")
+        query["status"] = "Needs Revision"
     elif pool in ("not_revised", "unrevised", "unflagged"):
-        query = query.filter((Question.status != "Needs Revision") | (Question.status.is_(None)))
+        query["status"] = {"$ne": "Needs Revision"}
     elif status:
-        query = query.filter(Question.status == status)
-
+        query["status"] = status
     if difficulty and difficulty != "all":
-        query = query.filter(Question.difficulty == difficulty)
+        query["difficulty"] = difficulty
+    pipeline = [{"$match": query}, {"$sample": {"size": count}}, {"$project": LIST_PROJECTION}]
+    try:
+        docs = list(db.questions.aggregate(pipeline))
+    except Exception:  # $sample unsupported (e.g. in-memory test db)
+        import random
+        all_docs = list(db.questions.find(query, LIST_PROJECTION))
+        docs = random.sample(all_docs, min(count, len(all_docs)))
+    paths = FolderPaths.for_user(db, current_user.id)
+    bm = bookmarked_ids(db, current_user.id)
+    return [to_list_item(q, bm, paths) for q in docs]
 
-    questions = query.order_by(func.random()).limit(count).all()
-
-    bookmarked_ids = {b.question_id for b in db.query(Bookmark).filter(Bookmark.user_id == current_user.id).all()}
-
-    result = []
-    for q in questions:
-        tags_list = []
-        try:
-            tags_list = json.loads(q.tags) if q.tags else []
-        except Exception:
-            tags_list = [q.tags] if q.tags else []
-
-        result.append(
-            QuestionListItem(
-                id=q.id,
-                folder_id=q.folder_id,
-                title=q.title,
-                problem_url=getattr(q, 'problem_url', '') or "",
-                difficulty=q.difficulty,
-                status=q.status,
-                tags=tags_list,
-                is_bookmarked=(q.id in bookmarked_ids),
-                folder_path=get_folder_path_string(db, q.folder_id) if q.folder_id else "",
-                position=q.position or 0,
-                created_at=q.created_at,
-                updated_at=q.updated_at
-            )
-        )
-    return result
 
 @router.get("/{question_id}", response_model=QuestionResponse)
-def get_question(
-    question_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
+def get_question(question_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    q = get_owned_question(db, current_user.id, question_id)
     if not q:
         raise HTTPException(status_code=404, detail="Question not found")
+    return to_response(db, q, current_user.id)
 
-    return format_question_response(db, q, current_user.id)
 
 @router.post("/", response_model=QuestionResponse, status_code=status.HTTP_201_CREATED)
-def create_question(
-    q_in: QuestionCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    actual_folder_id = None
-    if q_in.folder_id and q_in.folder_id.strip():
-        folder = db.query(Folder).filter(
-            Folder.id == q_in.folder_id.strip(),
-            Folder.user_id == current_user.id
-        ).first()
-        if not folder:
-            raise HTTPException(status_code=404, detail="Folder not found")
-        actual_folder_id = folder.id
-
-    tags_str = json.dumps(q_in.tags or [])
-
-    if q_in.position is not None and q_in.position > 0:
-        q_pos = q_in.position
-    else:
-        max_pos = db.query(func.max(Question.position)).filter(
-            Question.user_id == current_user.id,
-            Question.folder_id == actual_folder_id
-        ).scalar()
-        q_pos = (max_pos + 1) if max_pos is not None else 0
-
-    question = Question(
-        user_id=current_user.id,
-        folder_id=actual_folder_id,
+def create_question(q_in: QuestionCreate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    folder_id = _resolve_folder(db, current_user.id, q_in.folder_id)
+    position = q_in.position if q_in.position is not None else next_position(
+        db, "questions", {"user_id": current_user.id, "folder_id": folder_id}
+    )
+    url = (q_in.problem_url or "").strip()
+    doc = new_question_doc(
+        current_user.id,
+        folder_id=folder_id,
         title=q_in.title.strip(),
-        problem_url=(q_in.problem_url or "").strip(),
+        problem_url=url,
         problem_statement=q_in.problem_statement or "",
         notes=q_in.notes or "",
         difficulty=q_in.difficulty or "Medium",
-        status=q_in.status or "Not Started",
-        tags=tags_str,
-        position=q_pos
+        tags=q_in.tags or [],
+        position=position,
+        leetcode_slug=slug_from_url(url),
     )
-    db.add(question)
-    db.commit()
-    db.refresh(question)
-    save_question_mongo(question)
+    initial_status = q_in.status or "Not Started"
+    if initial_status != "Not Started":
+        updates: Dict[str, Any] = {}
+        apply_status(db, current_user.id, doc, initial_status, updates)
+        doc.update(updates)
+    db.questions.insert_one(doc)
+    return to_response(db, doc, current_user.id)
 
-    return format_question_response(db, question, current_user.id)
+
+@router.post("/bulk", response_model=BulkActionResponse)
+def bulk_action(body: BulkAction, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    uid = current_user.id
+    owned = list(db.questions.find({"user_id": uid, "id": {"$in": list(dict.fromkeys(body.question_ids))}}, {"_id": 0}))
+    ids = [q["id"] for q in owned]
+    now = now_iso()
+    if not ids:
+        raise HTTPException(status_code=404, detail="None of the selected questions were found")
+    a = body.action
+    if a == "delete":
+        return BulkActionResponse(action=a, updated=len(ids), trash_id=trash_questions(db, uid, ids))
+    if a == "move":
+        target = _resolve_folder(db, uid, body.folder_id)
+        start = next_position(db, "questions", {"user_id": uid, "folder_id": target})
+        bulk_update(db.questions, [
+            ({"id": qid, "user_id": uid}, {"$set": {"folder_id": target, "position": start + i, "updated_at": now}})
+            for i, qid in enumerate(ids)
+        ])
+    elif a == "set_status":
+        if not body.status:
+            raise HTTPException(status_code=422, detail="status is required")
+        ops = []
+        for q in owned:
+            updates: Dict[str, Any] = {"updated_at": now}
+            apply_status(db, uid, q, body.status, updates)
+            ops.append(({"id": q["id"], "user_id": uid}, {"$set": updates}))
+        if ops:
+            bulk_update(db.questions, ops)
+    elif a == "set_difficulty":
+        if not body.difficulty:
+            raise HTTPException(status_code=422, detail="difficulty is required")
+        db.questions.update_many({"user_id": uid, "id": {"$in": ids}}, {"$set": {"difficulty": body.difficulty, "updated_at": now}})
+    elif a in ("add_tags", "remove_tags"):
+        if not body.tags:
+            raise HTTPException(status_code=422, detail="tags are required")
+        ops = []
+        for q in owned:
+            tags = parse_tags(q.get("tags"))
+            if a == "add_tags":
+                tags = (tags + [t for t in body.tags if t not in tags])[:30]
+            else:
+                tags = [t for t in tags if t not in body.tags]
+            ops.append(({"id": q["id"], "user_id": uid}, {"$set": {"tags": tags, "updated_at": now}}))
+        if ops:
+            bulk_update(db.questions, ops)
+    elif a == "bookmark":
+        existing = bookmarked_ids(db, uid)
+        new = [{"id": new_id(), "user_id": uid, "question_id": qid, "created_at": now} for qid in ids if qid not in existing]
+        if new:
+            db.bookmarks.insert_many(new)
+    elif a == "unbookmark":
+        db.bookmarks.delete_many({"user_id": uid, "question_id": {"$in": ids}})
+    return BulkActionResponse(action=a, updated=len(ids))
+
 
 @router.post("/reorder")
-def reorder_questions(
-    items: List[ReorderItem],
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    for item in items:
-        db.query(Question).filter(
-            Question.id == item.id,
-            Question.user_id == current_user.id
-        ).update({"position": item.position})
-    db.commit()
-    reordered_qs = db.query(Question).filter(Question.id.in_([it.id for it in items])).all()
-    bulk_save_questions_mongo(reordered_qs)
+def reorder_questions(items: List[ReorderItem], db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    now = now_iso()
+    # One round trip instead of up to 2000 sequential updates.
+    ops = [
+        ({"id": item.id, "user_id": current_user.id}, {"$set": {"position": item.position, "updated_at": now}})
+        for item in items[:2000]
+    ]
+    if ops:
+        bulk_update(db.questions, ops)
     return {"message": "Questions reordered successfully"}
 
+
 @router.put("/{question_id}", response_model=QuestionResponse)
-def update_question(
-    question_id: str,
-    q_in: QuestionUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
+def update_question(question_id: str, q_in: QuestionUpdate, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    q = get_owned_question(db, current_user.id, question_id)
     if not q:
         raise HTTPException(status_code=404, detail="Question not found")
 
+    updates: Dict[str, Any] = {}
     if q_in.title is not None:
-        q.title = q_in.title.strip()
+        updates["title"] = q_in.title.strip()
     if q_in.problem_url is not None:
-        q.problem_url = q_in.problem_url.strip()
+        url = q_in.problem_url.strip()
+        updates["problem_url"] = url
+        # The LeetCode link follows the URL: a new or cleared URL must not keep the old problem's
+        # slug, or refresh/sync/import would act on the wrong problem.
+        slug = slug_from_url(url) or None
+        if slug != q.get("leetcode_slug"):
+            updates["leetcode_slug"] = slug
+            updates["leetcode_id"] = None
     if q_in.folder_id is not None:
-        folder = db.query(Folder).filter(
-            Folder.id == q_in.folder_id,
-            Folder.user_id == current_user.id
-        ).first()
-        if not folder:
-            raise HTTPException(status_code=404, detail="Target folder not found")
-        q.folder_id = q_in.folder_id
+        updates["folder_id"] = _resolve_folder(db, current_user.id, q_in.folder_id)
     if q_in.problem_statement is not None:
-        q.problem_statement = q_in.problem_statement
+        updates["problem_statement"] = q_in.problem_statement
     if q_in.notes is not None:
-        q.notes = q_in.notes
+        updates["notes"] = q_in.notes
     if q_in.difficulty is not None:
-        q.difficulty = q_in.difficulty
-    if q_in.status is not None:
-        q.status = q_in.status
+        updates["difficulty"] = q_in.difficulty
     if q_in.tags is not None:
-        q.tags = json.dumps(q_in.tags)
+        updates["tags"] = q_in.tags
     if q_in.position is not None:
-        q.position = q_in.position
+        updates["position"] = q_in.position
+    if q_in.status is not None:
+        apply_status(db, current_user.id, q, q_in.status, updates)
 
-    db.commit()
-    db.refresh(q)
-    save_question_mongo(q)
-    return format_question_response(db, q, current_user.id)
+    if updates:
+        updates["updated_at"] = now_iso()
+        db.questions.update_one({"id": question_id, "user_id": current_user.id}, {"$set": updates})
+        q.update(updates)
+    return to_response(db, q, current_user.id)
+
+
+@router.post("/{question_id}/attempt", response_model=QuestionResponse)
+def log_attempt(question_id: str, body: AttemptLog, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    q = get_owned_question(db, current_user.id, question_id)
+    if not q:
+        raise HTTPException(status_code=404, detail="Question not found")
+    updates: Dict[str, Any] = {
+        "attempts": int(q.get("attempts") or 0) + 1,
+        "time_spent_minutes": int(q.get("time_spent_minutes") or 0) + body.minutes,
+        "updated_at": now_iso(),
+    }
+    if body.solved:
+        apply_status(db, current_user.id, q, "Solved", updates)
+    elif (q.get("status") or "Not Started") == "Not Started":
+        updates["status"] = "In Progress"
+    record_activity(db, current_user.id, "attempt", question_id, minutes=body.minutes)
+    db.questions.update_one({"id": question_id, "user_id": current_user.id}, {"$set": updates})
+    q.update(updates)
+    return to_response(db, q, current_user.id)
+
 
 @router.post("/{question_id}/move")
-def move_question(
-    question_id: str,
-    move_in: QuestionMove,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
+def move_question(question_id: str, move_in: QuestionMove, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    q = get_owned_question(db, current_user.id, question_id)
     if not q:
         raise HTTPException(status_code=404, detail="Question not found")
+    target = _resolve_folder(db, current_user.id, move_in.target_folder_id)
+    updates: Dict[str, Any] = {"folder_id": target, "updated_at": now_iso()}
+    updates["position"] = move_in.new_position if move_in.new_position is not None else next_position(
+        db, "questions", {"user_id": current_user.id, "folder_id": target}
+    )
+    db.questions.update_one({"id": question_id, "user_id": current_user.id}, {"$set": updates})
+    return {"message": "Question moved successfully", "question_id": question_id, "folder_id": target}
 
-    target_folder = db.query(Folder).filter(
-        Folder.id == move_in.target_folder_id,
-        Folder.user_id == current_user.id
-    ).first()
-    if not target_folder:
-        raise HTTPException(status_code=404, detail="Target folder not found")
-
-    q.folder_id = move_in.target_folder_id
-    if move_in.new_position is not None:
-        q.position = move_in.new_position
-
-    db.commit()
-    db.refresh(q)
-    save_question_mongo(q)
-    return {"message": "Question moved successfully", "question_id": q.id, "folder_id": q.folder_id}
 
 @router.delete("/{question_id}")
-def delete_question(
-    question_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    q = db.query(Question).filter(
-        Question.id == question_id,
-        Question.user_id == current_user.id
-    ).first()
+def delete_question(question_id: str, db: Database = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
+    q = get_owned_question(db, current_user.id, question_id)
     if not q:
         raise HTTPException(status_code=404, detail="Question not found")
-
-    db.delete(q)
-    db.commit()
-    delete_question_mongo(question_id)
-    return {"message": "Question deleted successfully", "id": question_id}
+    trash_id = trash_questions(db, current_user.id, [question_id])
+    return {"message": "Question moved to trash", "id": question_id, "trash_id": trash_id}
